@@ -1,0 +1,48 @@
+# Publishes @bitora/guard to npm with trusted publishing (OIDC): no npm token is stored anywhere. npm accepts the publish only
+# from this workflow file in this repository, as registered in the package settings on npmjs.com. The repository is public, so
+# npm also attaches the provenance statement (who built it, from which commit).
+# It runs when a tag guard-vX.Y.Z is pushed (the tag must match the version in pkg/package.json), or by hand to check the package
+# without publishing (dry run).
+name: publish-guard
+on:
+  push:
+    tags: ['guard-v*']
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Only pack and check, do not publish'
+        type: boolean
+        default: true
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Trusted publishing needs npm 11.5.1 or newer; Node 24 ships it.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+      - run: node --test guard.test.mjs
+      - name: The tag must be the version in pkg/package.json
+        if: startsWith(github.ref, 'refs/tags/')
+        working-directory: pkg
+        run: |
+          v="$(node -p "require('./package.json').version")"
+          if [ "${GITHUB_REF_NAME}" != "guard-v${v}" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match package.json version ${v}" >&2
+            exit 1
+          fi
+      - name: Publish
+        working-directory: pkg
+        env:
+          DRY: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+        run: |
+          if [ "${DRY}" = "true" ]; then
+            npm publish --dry-run --access public
+          else
+            npm publish --access public --provenance
+          fi

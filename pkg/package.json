@@ -1,0 +1,39 @@
+{
+  "name": "@bitora/guard",
+  "version": "2.1.2",
+  "description": "Protection that runs on your own server: rate limits, an AI-spend budget, and detections that read the answers (brute force, credential stuffing, scans, id sweeps). Reports to Bitora Security. Fail-open.",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./next": "./next.js",
+    "./express": "./express.js",
+    "./hono": "./hono.js",
+    "./deno": "./deno.js",
+    "./node": "./node.js",
+    "./store": "./store.js"
+  },
+  "files": [
+    "index.js",
+    "detect.js",
+    "shield.js",
+    "node.js",
+    "next.js",
+    "express.js",
+    "hono.js",
+    "deno.js",
+    "README.md",
+    "LICENSE",
+    "store.js"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Bitora-Studio/bitora-guard.git",
+    "directory": "pkg"
+  },
+  "homepage": "https://security.bitora.es"
+}
