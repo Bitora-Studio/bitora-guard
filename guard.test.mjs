@@ -1,11 +1,16 @@
 // Tests of @bitora/guard. Run with: node --test internal/guardpkg/guard.test.mjs
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { createGuard, describe } from './pkg/index.js'
+import { createGuard as realCreateGuard, describe } from './pkg/index.js'
 import { bitoraExpress } from './pkg/express.js'
 import { bitoraMiddleware } from './pkg/next.js'
 import { bitoraHono } from './pkg/hono.js'
 import { bitoraStore, memoryStore, redisStore, upstashStore } from './pkg/store.js'
+
+// The package works only with a licence (see license.js). The tests of its behaviour run with one that is always valid; the tests of the
+// licence itself are at the end and use the real thing.
+const ACTIVE = { usable: () => true, ready: async () => true, status: () => 'active', reason: () => '' }
+const createGuard = (o = {}) => realCreateGuard({ __license: ACTIVE, ...o })
 
 const req = (path, { ip = '203.0.113.7', agent = 'Mozilla/5.0 Chrome/120', method = 'GET' } = {}) =>
   new Request('https://shop.example.com' + path, { method, headers: { 'x-forwarded-for': ip, 'user-agent': agent } })
@@ -1042,4 +1047,150 @@ test('the list of blocked addresses is asked for with its tag, and an unchanged 
   assert.equal((await g.check(req('/', { ip: '198.51.100.9' }))).status, 403, 'still blocked after a 304')
   await new Promise((r) => setTimeout(r, 10))
   assert.deepEqual(seen, [null, '"v1"'], 'the second download carried the tag')
+})
+
+// ---- the licence ----
+import { createLicense } from './pkg/license.js'
+import { generateKeyPairSync, sign as edSign, createHash } from 'node:crypto'
+
+const keys = generateKeyPairSync('ed25519')
+const other = generateKeyPairSync('ed25519')
+const PUB = keys.publicKey.export({ type: 'spki', format: 'der' }).subarray(-32).toString('base64')
+const kh = (secret) => createHash('sha256').update(secret).digest('hex').slice(0, 16)
+const licenseFor = (secret, { exp = Math.floor(Date.now() / 1000) + 7 * 86400, key = keys.privateKey, v = 1, hash = kh(secret) } = {}) => {
+  const body = Buffer.from(JSON.stringify({ v, site: 's1', kh: hash, plan: 'pro', iat: Math.floor(Date.now() / 1000), exp })).toString('base64url')
+  return body + '.' + edSign(null, Buffer.from(body), key).toString('base64url')
+}
+const serverReturning = (handler) => {
+  const calls = []
+  const fetch = async (url, init) => {
+    calls.push({ url, auth: init?.headers?.authorization })
+    return handler(calls.length)
+  }
+  return { fetch, calls }
+}
+const ok = (lic) => new Response(JSON.stringify({ license: lic, renew_after_s: 21600 }), { status: 200 })
+
+test('licence: a valid one signed by Bitora for this key turns the package on', async () => {
+  const s = serverReturning(() => ok(licenseFor('bsec_k1')))
+  const l = createLicense({ secret: 'bsec_k1', fetch: s.fetch, publicKey: PUB })
+  assert.equal(l.usable(), false, 'before the first answer it is off')
+  assert.equal(await l.ready(), true)
+  assert.equal(l.status(), 'active')
+  assert.equal(s.calls[0].auth, 'Bearer bsec_k1')
+  assert.ok(s.calls[0].url.endsWith('/api/v1/guard/license'))
+  assert.equal(l.usable(), true)
+  assert.equal(s.calls.length, 1, 'it is kept, not asked for again')
+})
+
+test('licence: one for another key, signed by someone else, tampered or expired does not work', async () => {
+  for (const [name, lic] of [
+    ['another key', licenseFor('bsec_other')],
+    ['signed by someone else', licenseFor('bsec_k1', { key: other.privateKey })],
+    ['expired', licenseFor('bsec_k1', { exp: Math.floor(Date.now() / 1000) - 10 })],
+    ['another version', licenseFor('bsec_k1', { v: 2 })],
+    ['garbage', 'not.a.licence'],
+    ['no signature', licenseFor('bsec_k1').split('.')[0]],
+  ]) {
+    const l = createLicense({ secret: 'bsec_k1', fetch: serverReturning(() => ok(lic)).fetch, publicKey: PUB })
+    assert.equal(await l.ready(), false, name)
+    assert.equal(l.status(), 'inactive', name)
+  }
+  const good = licenseFor('bsec_k1')
+  const [body, sig] = good.split('.')
+  const forged = Buffer.from(JSON.stringify({ ...JSON.parse(Buffer.from(body, 'base64url')), plan: 'enterprise' })).toString('base64url') + '.' + sig
+  const l = createLicense({ secret: 'bsec_k1', fetch: serverReturning(() => ok(forged)).fetch, publicKey: PUB })
+  assert.equal(await l.ready(), false, 'a changed licence does not verify')
+})
+
+test('licence: without a subscription (402) or with a key Bitora refuses (401) it stays off and does not insist', async () => {
+  for (const [code, reason] of [
+    [402, 'subscription_required'],
+    [401, 'bad_key'],
+  ]) {
+    const s = serverReturning(() => new Response('{}', { status: code }))
+    const l = createLicense({ secret: 'bsec_k1', fetch: s.fetch, publicKey: PUB })
+    assert.equal(await l.ready(), false)
+    assert.equal(l.reason(), reason)
+    for (let i = 0; i < 5; i++) assert.equal(l.usable(), false)
+    await l.ready()
+    assert.equal(s.calls.length, 1, 'it does not ask again for a while: ' + reason)
+  }
+})
+
+test('licence: without a key it is off and never calls anybody', async () => {
+  const s = serverReturning(() => ok('x'))
+  const l = createLicense({ secret: '', fetch: s.fetch, publicKey: PUB })
+  assert.equal(await l.ready(), false)
+  assert.equal(l.reason(), 'no_key')
+  assert.equal(s.calls.length, 0)
+})
+
+test('licence: if Bitora cannot be reached a licence that is still valid keeps working, and it is renewed when due', async () => {
+  let t = Date.now()
+  let down = false
+  const s = serverReturning(() => {
+    if (down) throw new Error('network')
+    return ok(licenseFor('bsec_k1'))
+  })
+  const l = createLicense({ secret: 'bsec_k1', fetch: s.fetch, publicKey: PUB, now: () => t })
+  assert.equal(await l.ready(), true)
+  down = true
+  t += 7 * 3600 * 1000 // the renewal is due and Bitora is down
+  assert.equal(l.usable(), true, 'the last licence is still good')
+  await new Promise((r) => setTimeout(r, 20))
+  assert.equal(l.usable(), true)
+  assert.ok(s.calls.length >= 2, 'it tried to renew')
+  t += 8 * 86400 * 1000 // the licence ran out and nobody answered
+  assert.equal(l.usable(), false)
+})
+
+test('licence: one handed to the package at startup works without asking anybody', async () => {
+  const s = serverReturning(() => ok('x'))
+  const l = createLicense({ secret: 'bsec_k1', fetch: s.fetch, publicKey: PUB, token: licenseFor('bsec_k1') })
+  assert.equal(await l.ready(), true)
+  assert.equal(s.calls.length, 0)
+  const bad = createLicense({ secret: 'bsec_k2', fetch: serverReturning(() => new Response('{}', { status: 402 })).fetch, publicKey: PUB, token: licenseFor('bsec_k1') })
+  assert.equal(await bad.ready(), false, 'a licence for another key is not accepted')
+})
+
+test('without a licence the guard does nothing: traffic passes, nothing is reported or counted, and it never throws', async () => {
+  const sent = []
+  const fetch = async (url) => {
+    sent.push(url)
+    return new Response('{}', { status: 402 })
+  }
+  const g = realCreateGuard({ secret: 'bsec_k1', fetch, trustProxy: 1, mode: 'enforce', rateLimit: { max: 1, windowSec: 60 }, remote: { enabled: false } })
+  for (let i = 0; i < 5; i++) assert.equal((await g.check(req('/', { ip: '198.51.100.9' }))).action, 'allow', 'the rate limit does not apply')
+  g.observe(req('/login', { method: 'POST' }), { status: 401 })
+  g.note('ssrf_blocked', { ip: '198.51.100.9' })
+  assert.equal(g.signup({ email: 'a@mailinator.com', ip: '198.51.100.9' }).action, 'allow')
+  assert.equal(g.flow('x', { ip: '198.51.100.9' }).action, 'allow')
+  assert.equal((await g.limit('x', { key: 'k', max: 1 })).allowed, true)
+  assert.equal((await g.decide('signup', { email: 'a@b.co', ip: '198.51.100.9' })).checked, false)
+  assert.equal(g.inspect({ path: '/', search: "?q=' or 1=1--", agent: '', referer: '' }, undefined, Date.now()), null)
+  await g.flush()
+  assert.ok(sent.every((u) => u.endsWith('/api/v1/guard/license')), 'the only call it makes is the one for the licence: ' + sent.join(','))
+  assert.equal(g.license.status(), 'inactive')
+  assert.equal(g.license.reason(), 'subscription_required')
+  const handler = async () => new Response('ok')
+  assert.equal(await (await g.route(handler)(req('/'))).text(), 'ok')
+})
+
+test('with a licence the same guard protects', async () => {
+  const lic = licenseFor('bsec_k1')
+  const g = realCreateGuard({
+    secret: 'bsec_k1',
+    license: lic,
+    __licensePublicKey: PUB,
+    fetch: serverReturning(() => new Response('{}', { status: 200 })).fetch,
+    trustProxy: 1,
+    mode: 'enforce',
+    rateLimit: { max: 1, windowSec: 60 },
+    remote: { enabled: false },
+    report: { enabled: false },
+  })
+  assert.equal((await g.check(req('/', { ip: '198.51.100.9' }))).action, 'allow')
+  assert.equal((await g.check(req('/', { ip: '198.51.100.9' }))).action, 'block', 'the second request is over the limit')
+  assert.equal(g.license.status(), 'active')
 })

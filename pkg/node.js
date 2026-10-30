@@ -180,6 +180,8 @@ export function guardFetch(guard, options = {}) {
     }
   }
   return async function safeFetch(input, init = {}) {
+    // Part of the package: without an active licence it is a plain fetch (the guard is switched off, see license.js).
+    if (guard && typeof guard.licensed === 'function' && !(await guard.license.ready())) return fetch(input, init)
     let method = (init.method || 'GET').toUpperCase()
     let body = init.body === undefined ? undefined : typeof init.body === 'string' || Buffer.isBuffer(init.body) || init.body instanceof Uint8Array ? init.body : String(init.body)
     const headers = {}

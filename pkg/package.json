@@ -1,6 +1,6 @@
 {
   "name": "@bitora/guard",
-  "version": "2.1.2",
+  "version": "3.0.0",
   "description": "Protection that runs on your own server: rate limits, an AI-spend budget, and detections that read the answers (brute force, credential stuffing, scans, id sweeps). Reports to Bitora Security. Fail-open.",
   "type": "module",
   "main": "./index.js",
@@ -24,12 +24,13 @@
     "deno.js",
     "README.md",
     "LICENSE",
-    "store.js"
+    "store.js",
+    "license.js"
   ],
   "engines": {
     "node": ">=18"
   },
-  "license": "MIT",
+  "license": "SEE LICENSE IN LICENSE",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Bitora-Studio/bitora-guard.git",

@@ -4,6 +4,7 @@
 // site stays up. In "observe" mode (the default) it never blocks anything: it only reports what it would have done.
 
 import { createDetector, isTrap, jsonShape, template } from './detect.js'
+import { createLicense } from './license.js'
 import { createShield } from './shield.js'
 import { memoryStore } from './store.js'
 
@@ -208,6 +209,9 @@ export function createGuard(options = {}) {
   const o = merge(DEFAULTS, options)
   const now = options.now || (() => Date.now())
   const doFetch = options.fetch || globalThis.fetch
+  // The licence: this package works for a site of a Bitora Security subscriber (see license.js). Without one every call below lets the
+  // traffic through and reports nothing. options.__license is only for this package's own tests.
+  const lic = options.__license || createLicense({ secret: o.secret, apiUrl: o.apiUrl, fetch: doFetch, now, token: options.license, publicKey: options.__licensePublicKey })
   const windows = new Windows()
   const detector = createDetector({ now, detect: o.detect })
   const shield = createShield(o.shield)
@@ -649,6 +653,7 @@ export function createGuard(options = {}) {
         for (const [key, windowSec] of c.charged) windows.add(key, windowSec, actual - c.reserve, now())
       }
       const handler = async (call, params) => {
+        if (!(await lic.ready())) return call(params)
         const ctx = { user: typeof opts.user === 'function' ? opts.user() : opts.user, ip: typeof opts.ip === 'function' ? opts.ip() : opts.ip }
         let c
         try {
@@ -828,5 +833,45 @@ export function createGuard(options = {}) {
     }
   }
 
-  return { check, inspect, observe, route, auth, event, note, flow, limit, decide, isBreached, accountOf, flush, ai, signup, options: o }
+  // Every public call goes through the licence. The asynchronous ones wait (up to a second and a half, once) for the first answer, which
+  // is what a cold start in serverless needs; the synchronous ones only use what is already known. Without a licence they let everything pass.
+  const idle = { action: 'allow', reasons: [], checked: false }
+  lic.usable() // start asking now, so the first request is not the one that waits
+  return {
+    check: async (req, extra) => ((await lic.ready()) ? check(req, extra) : allow),
+    inspect: (r, body, t) => (lic.usable() ? inspect(r, body, t) : null),
+    observe: (req, a) => {
+      if (lic.usable()) observe(req, a)
+    },
+    route: (handler, opts) => {
+      const wrapped = route(handler, opts)
+      return async (request, ctx) => ((await lic.ready()) ? wrapped(request, ctx) : handler(request, ctx))
+    },
+    auth: {
+      failed: (a) => {
+        if (lic.usable()) auth.failed(a)
+      },
+      succeeded: (a) => {
+        if (lic.usable()) auth.succeeded(a)
+      },
+    },
+    event: (name, a) => {
+      if (lic.usable()) event(name, a)
+    },
+    note: (kind, a) => {
+      if (lic.usable()) note(kind, a)
+    },
+    flow: (name, a) => (lic.usable() ? flow(name, a) : { action: 'allow', reasons: [] }),
+    limit: async (name, a) => ((await lic.ready()) ? limit(name, a) : { action: 'allow', allowed: true, count: 0, checked: false }),
+    decide: async (kind, a) => ((await lic.ready()) ? decide(kind, a) : idle),
+    isBreached: async (password) => ((await lic.ready()) ? isBreached(password) : { breached: false, count: 0, checked: false }),
+    accountOf,
+    flush: () => (lic.usable() ? flush() : Promise.resolve()),
+    ai,
+    signup: (a) => (lic.usable() ? signup(a) : { action: 'allow', reasons: [] }),
+    // The state of the licence: 'active', 'inactive' (with the reason: subscription_required, bad_key, no_key, unreachable) or 'checking'.
+    license: { status: lic.status, reason: lic.reason, ready: lic.ready },
+    licensed: lic.usable,
+    options: o,
+  }
 }

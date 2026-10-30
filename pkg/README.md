@@ -2,7 +2,7 @@
 
 Protection that runs on **your** server. It limits requests, caps the endpoints that cost money (AI), checks
 automation on the paths you choose, **reads the answers of your app** to spot brute force, credential stuffing, scans and
-id sweeps, and tells Bitora Security what it saw so it shows up in your panel. MIT licence.
+id sweeps, and tells Bitora Security what it saw so it shows up in your panel. **It needs an active Bitora Security subscription** (see [Licence](#licence-and-subscription)).
 
 - **Fast and local.** The decision is made in your process in well under a millisecond.
 - **Fail-open.** If Bitora does not answer, the request goes through. Your site does not depend on ours.
@@ -137,6 +137,22 @@ const s = await guard.decide("signup", { email, ip, ipSource }) // MX of the dom
 - Anything that goes straight from the browser to your database (Supabase, Firebase) never passes through here.
 - It does not stop volumetric DDoS; that belongs to your platform's firewall.
 - Next.js `proxy.ts` / `middleware.ts` alone cannot read answers, so use `guard.route` on the handlers that matter.
+
+## Licence and subscription
+
+From 3.0 this package works for the sites of a Bitora Security subscriber. At start it asks Bitora for a licence with the API key of your site
+(`BITORA_SECRET`), checks its signature locally and renews it in the background every few hours. A licence lasts seven days, so a short
+outage of Bitora does not switch anything off.
+
+Without an active subscription, a valid key or a licence that verifies, the package **does nothing and lets all traffic through**: it never
+takes your site down, and it never sends anything. It writes one line to your log saying why. `guard.license.status()` returns
+`'active'`, `'inactive'` or `'checking'`, and `guard.license.reason()` tells you why it is inactive (`subscription_required`, `bad_key`,
+`no_key`, `unreachable`).
+
+In serverless, the first request of a cold instance waits up to a second and a half for the licence. To avoid even that, pass the licence you
+last received: `createGuard({ secret, license: process.env.BITORA_LICENSE })`.
+
+The terms are in [LICENSE](./LICENSE). Versions 2.0 to 2.1.2 were released under the MIT licence.
 
 ## Install
 
