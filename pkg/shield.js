@@ -169,6 +169,10 @@ const safeName = (n) => String(n).replace(/[^\w.$\[\]-]/g, '').slice(0, 60)
 export function createShield(cfg = {}) {
   const level = cfg.paranoia === 2 ? 2 : 1
   const exclusions = cfg.exclusions || []
+  // Rules in shadow mode (shadow: ['sqli.union', 'xss']) are evaluated and reported but never add points: a way to try a rule on real traffic and read
+  // what it would have done before it is allowed to refuse anyone. A prefix without a dot matches the whole family.
+  const shadowList = cfg.shadow || []
+  const isShadow = (id) => shadowList.some((p) => id === p || id.startsWith(p + '.'))
   const rules = RULES.filter((r) => r.pl <= level)
 
   const excluded = (route, name, id) =>
@@ -212,11 +216,16 @@ export function createShield(cfg = {}) {
     }
     let score = 0
     const matched = []
+    const shadow = []
     for (const [id, h] of hits) {
+      if (isShadow(id)) {
+        shadow.push({ id, param: safeName(h.param) })
+        continue
+      }
       score += h.points
       matched.push({ id, param: safeName(h.param) })
     }
-    return { score, matched }
+    return { score, matched, shadow }
   }
   return { scan, level, threshold: cfg.threshold || 5 }
 }

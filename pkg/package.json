@@ -11,7 +11,8 @@
     "./hono": "./hono.js",
     "./deno": "./deno.js",
     "./node": "./node.js",
-    "./store": "./store.js"
+    "./store": "./store.js",
+    "./sinks": "./sinks.js"
   },
   "files": [
     "index.js",
@@ -25,7 +26,8 @@
     "README.md",
     "LICENSE",
     "store.js",
-    "license.js"
+    "license.js",
+    "sinks.js"
   ],
   "engines": {
     "node": ">=18"

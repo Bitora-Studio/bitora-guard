@@ -138,6 +138,30 @@ const s = await guard.decide("signup", { email, ip, ipSource }) // MX of the dom
 - It does not stop volumetric DDoS; that belongs to your platform's firewall.
 - Next.js `proxy.ts` / `middleware.ts` alone cannot read answers, so use `guard.route` on the handlers that matter.
 
+## Sinks: check what a value does when your code uses it
+
+The Shield guesses from the shape of a request. A sink checks the exact moment a visitor's value does something on your server, so it catches
+what the Shield missed with almost no false positives.
+
+```js
+import { createSinks } from '@bitora/guard/sinks'   // Node
+const sink = createSinks(guard)
+
+sink.sql(query, [req.query.id])          // SQL you build as text: did a value change the structure of the statement?
+sink.path('/srv/uploads', req.query.f)   // the path must stay inside its folder
+sink.filterValue(req.query.name)         // a value you put inside a PostgREST .or('name.eq.' + v)
+sink.pick(req.body, ['name', 'email'])   // only the fields you allow reach .insert() / .update()
+```
+
+In `observe` a sink never throws: it lets the call through and reports the NAME of the sink (never the value). In `enforce` it throws a
+`BlockedSinkError`; `pick` always drops the extra fields, which is the fix, and reports their names. Parameterised queries remain the right
+fix for SQL: `sink.sql` is for the places where you still build it as text.
+
+## Shadow rules
+
+Try a rule on real traffic before it is allowed to refuse anybody: `createGuard({ shield: { shadow: ['sqli.union', 'xss'] } })`. A rule (or a
+whole family, without the dot) in shadow mode is evaluated and reported as "would have" but adds no points and never blocks.
+
 ## Licence and subscription
 
 From 3.0 this package works for the sites of a Bitora Security subscriber. At start it asks Bitora for a licence with the API key of your site

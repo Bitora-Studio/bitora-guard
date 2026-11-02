@@ -221,6 +221,10 @@ export function createGuard(options = {}) {
   function inspect(r, body, t) {
     if (!o.shield.enabled) return null
     const res = shield.scan({ path: r.path, search: r.search, body, agent: r.agent, referer: r.referer })
+    // Rules in shadow mode add no points and never refuse: they are reported as "would have" so they can be judged on real traffic first.
+    if (res.shadow?.length) {
+      reportFinding({ rule: 'shield', ip: r.ip, path: template(r.path).template, count: 1, windowSec: 0, points: 0, param: res.shadow[0].param, rules: [...new Set(res.shadow.map((m) => m.id))].slice(0, 8) }, r.ipSource, 'reported', true)
+    }
     if (!res.matched.length) return null
     const points = Math.min(res.score, 5)
     const flagged = res.score >= shield.threshold
@@ -717,7 +721,7 @@ export function createGuard(options = {}) {
   // ---- things the app tells us about, outside any request ----
   // note(kind, { ip, ipSource, param, points }) reports an event of the app or of a sink (guardFetch, signup, flow). Kinds
   // other than these three are ignored. It never throws.
-  const NOTES = { ssrf_blocked: 0, signup_blocked: 3, flow_limited: 3 }
+  const NOTES = { ssrf_blocked: 0, signup_blocked: 3, flow_limited: 3, sink_blocked: 0 }
   function note(kind, a = {}) {
     try {
       if (!(kind in NOTES)) return

@@ -1194,3 +1194,89 @@ test('with a licence the same guard protects', async () => {
   assert.equal((await g.check(req('/', { ip: '198.51.100.9' }))).action, 'block', 'the second request is over the limit')
   assert.equal(g.license.status(), 'active')
 })
+
+// ---- shadow rules (G14) ----
+test('a rule in shadow mode is evaluated and reported but never adds points', () => {
+  const normal = createShield()
+  const shadow = createShield({ shadow: ['sqli.union'] })
+  const q = "?q=1 UNION SELECT username,password FROM users"
+  assert.ok(scoreOf(normal, { query: q }).score >= 5)
+  const r = scoreOf(shadow, { query: q })
+  assert.equal(r.score, 0, 'no points from a shadow rule')
+  assert.deepEqual(r.shadow.map((m) => m.id), ['sqli.union'])
+  // a family prefix covers all of it, other families are untouched
+  const fam = createShield({ shadow: ['sqli'] })
+  assert.equal(scoreOf(fam, { query: q }).score, 0)
+  assert.ok(scoreOf(fam, { query: '?q=<script>alert(1)</script>' }).score >= 5)
+})
+
+test('shadow findings are reported as "would have" and the request goes through even in enforce mode', async () => {
+  const b = fakeBitora()
+  const g = createGuard({ secret: 'bsec_x', trustProxy: 1, mode: 'enforce', fetch: b.fetch, remote: { enabled: false }, shield: { shadow: ['sqli'] }, __license: { usable: () => true, ready: async () => true, status: () => 'active', reason: () => '' } })
+  const out = await g.check(req('/api/items?id=1%20UNION%20SELECT%20username,password%20FROM%20users', { ip: '198.51.100.20' }))
+  assert.equal(out.action, 'allow', 'a shadow rule never refuses')
+  await g.flush()
+  const ev = b.calls.events.flat().find((e) => e.kind === 'shield')
+  assert.ok(ev, 'a shield finding was reported')
+  assert.equal(ev.would_have, true, 'reported as what it would have done')
+  assert.ok(ev.rules.includes('sqli.union'))
+  assert.ok(!(ev.score > 0), 'and it added no points')
+})
+
+// ---- sinks (G5) ----
+import { createSinks, BlockedSinkError, sqlStructure, tokenizeSql } from './pkg/sinks.js'
+
+test('sql sink: a value that stays inside one token is fine, one that changes the structure is not', () => {
+  assert.equal(sqlStructure("SELECT * FROM users WHERE id = 42", ['42']).injected, false)
+  assert.equal(sqlStructure("SELECT * FROM users WHERE name = 'alice'", ['alice']).injected, false)
+  assert.equal(sqlStructure("SELECT * FROM users WHERE name = 'select union drop'", ['select union drop']).injected, false, 'keywords inside a string are text')
+  assert.equal(sqlStructure("SELECT * FROM users WHERE name = 'O''Brien'", ["O'Brien"]).injected, false, 'properly escaped: the input does not even appear')
+  assert.equal(sqlStructure("SELECT * FROM users WHERE id = 1 OR 1=1", ['1 OR 1=1']).injected, true, 'a tautology added to a number')
+  assert.equal(sqlStructure("SELECT * FROM users WHERE name = '' OR '1'='1'", ["' OR '1'='1"]).injected, true, 'a quote that closes the string')
+  assert.equal(sqlStructure("SELECT * FROM users WHERE name = 'x'; DROP TABLE users; --'", ["x'; DROP TABLE users; --"]).injected, true, 'stacked statement and comment')
+  assert.equal(sqlStructure("SELECT * FROM t WHERE a = 1 -- AND b = 2", ['1 -- AND b = 2']).injected, true, 'a comment that cuts the rest of the query')
+  assert.equal(sqlStructure("SELECT * FROM users", []).injected, false)
+  assert.ok(tokenizeSql("a 'b''c' \"d\" 12 -- x").map((t) => t.type).join() === 'word,string,ident,number,comment')
+})
+
+test('the sinks only report in observe mode and throw in enforce mode', () => {
+  const notes = []
+  const guard = (mode) => ({ options: { mode }, licensed: () => true, note: (k, a) => notes.push([k, a.param]) })
+  const observe = createSinks(guard('observe'))
+  const q = "SELECT * FROM users WHERE id = 1 OR 1=1"
+  assert.equal(observe.sql(q, ['1 OR 1=1']), q, 'observe: the call goes through')
+  assert.deepEqual(notes.pop(), ['sink_blocked', 'sql'])
+  const enforce = createSinks(guard('enforce'))
+  assert.throws(() => enforce.sql(q, ['1 OR 1=1']), BlockedSinkError)
+  assert.equal(enforce.sql("SELECT 1 WHERE id = 7", ['7']), 'SELECT 1 WHERE id = 7', 'a clean query is never blocked')
+  assert.equal(notes.length, 1, 'and reports nothing')
+})
+
+test('path sink keeps a path inside its folder', () => {
+  const notes = []
+  const sinks = (mode) => createSinks({ options: { mode }, licensed: () => true, note: (k, a) => notes.push(a.param) })
+  assert.ok(sinks('enforce').path('/srv/uploads', 'a', 'b.txt').endsWith('b.txt'))
+  assert.throws(() => sinks('enforce').path('/srv/uploads', '../../etc/passwd'), BlockedSinkError)
+  assert.throws(() => sinks('enforce').path('/srv/uploads', '/etc/passwd'), BlockedSinkError, 'an absolute part replaces the base')
+  sinks('observe').path('/srv/uploads', '../x')
+  assert.deepEqual(notes, ['path', 'path', 'path'], 'it reports when it throws too')
+})
+
+test('postgrest filter values and mass assignment', () => {
+  const notes = []
+  const sinks = (mode) => createSinks({ options: { mode }, licensed: () => true, note: (k, a) => notes.push(a.param) })
+  assert.equal(sinks('observe').filterValue('ana'), 'ana')
+  assert.equal(sinks('observe').filterValue('x),role.eq.admin,(y'), '"x),role.eq.admin,(y"', 'quoted so it stays one value')
+  assert.throws(() => sinks('enforce').filterValue('a,b'), BlockedSinkError)
+  const body = { name: 'Ana', email: 'a@x.co', role: 'admin', is_admin: true }
+  assert.deepEqual(sinks('enforce').pick(body, ['name', 'email']), { name: 'Ana', email: 'a@x.co' }, 'extra fields are dropped, not only detected')
+  assert.ok(notes.includes('mass-assignment'))
+  assert.deepEqual(sinks('observe').pick({ name: 'Ana' }, ['name']), { name: 'Ana' })
+})
+
+test('without a licence the sinks do nothing', () => {
+  const sinks = createSinks({ options: { mode: 'enforce' }, licensed: () => false, note: () => assert.fail('nothing is reported') })
+  assert.equal(sinks.sql('SELECT 1 WHERE a = 1 OR 1=1', ['1 OR 1=1']), 'SELECT 1 WHERE a = 1 OR 1=1')
+  assert.equal(sinks.filterValue('a,b'), 'a,b')
+  assert.deepEqual(sinks.pick({ role: 'x' }, ['name']), { role: 'x' })
+})
