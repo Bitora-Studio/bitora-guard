@@ -4,6 +4,7 @@
 // site stays up. In "observe" mode (the default) it never blocks anything: it only reports what it would have done.
 
 import { createDetector, isTrap, jsonShape, template } from './detect.js'
+import { canary as canaryOf, redact as redactOut, scan as scanOut } from './aiout.js'
 import { createBreaker } from './breaker.js'
 import { cspHeaders, makeNonce, parseReports } from './csp.js'
 import { createLicense } from './license.js'
@@ -781,7 +782,7 @@ export function createGuard(options = {}) {
   // ---- things the app tells us about, outside any request ----
   // note(kind, { ip, ipSource, param, points }) reports an event of the app or of a sink (guardFetch, signup, flow). Kinds
   // other than these three are ignored. It never throws.
-  const NOTES = { ssrf_blocked: 0, signup_blocked: 3, flow_limited: 3, sink_blocked: 0, csp_violation: 0 }
+  const NOTES = { ssrf_blocked: 0, signup_blocked: 3, flow_limited: 3, sink_blocked: 0, csp_violation: 0, ai_output_leak: 0 }
   function note(kind, a = {}) {
     try {
       if (!(kind in NOTES)) return
@@ -990,6 +991,24 @@ export function createGuard(options = {}) {
     // headers(): a strict CSP, Trusted Types and Integrity-Policy as REPORT-ONLY, with a nonce for your scripts. Inert (no headers) without a licence.
     headers: (a = {}) => (lic.usable() ? cspHeaders({ reportPath: o.csp.reportPath, ...a }) : { nonce: a.nonce || makeNonce(), headers: {} }),
     reports: async (req, bodyText) => ((await lic.ready()) ? reports(req, bodyText) : isReportRequest(req.method, describe(req, o).path) ? new Response(null, { status: 204 }) : null),
+    // aiOutput reads what a model answers before you send it on (see aiout.js): canary() gives the token to put in your system prompt, check(text)
+    // reports a leak of it, of a secret or of a card number (only the KIND) and, in enforce mode, returns the text with them redacted.
+    aiOutput: {
+      canary: () => canaryOf(o.secret),
+      check: async (text, a = {}) => {
+        const plain = String(text ?? '')
+        if (!lic.usable()) return { kinds: [], text: plain }
+        try {
+          const c = await canaryOf(o.secret)
+          const kinds = scanOut(plain, c)
+          for (const k of kinds) note('ai_output_leak', { ...a, param: k })
+          if (!kinds.length) return { kinds, text: plain }
+          return enforcing() ? { kinds, text: redactOut(plain, c) } : { kinds, text: plain, wouldHave: 'redacted' }
+        } catch {
+          return { kinds: [], text: plain }
+        }
+      },
+    },
     licensed: lic.usable,
     options: o,
   }

@@ -65,6 +65,17 @@ function serviceRoleJwt(text) {
 
 const anyOf = (list, text) => list.some((re) => re.test(text))
 
+// Used by the reader of what a model answers (aiout.js): is there a secret in this text, and the text without them.
+export function hasSecret(text) {
+  return anyOf(SECRET, text) || serviceRoleJwt(text)
+}
+
+export function redactSecrets(text) {
+  let t = text
+  for (const re of SECRET) t = t.replace(new RegExp(re.source, re.flags.includes("g") ? re.flags : re.flags + "g"), "[redacted]")
+  return t.replace(/eyJ[A-Za-z0-9_-]{8,}.eyJ[A-Za-z0-9_-]{8,}.[A-Za-z0-9_-]{8,}/g, (m) => (serviceRoleJwt(m) ? "[redacted]" : m))
+}
+
 // scanResponse({ status, contentType, body }) -> the kinds of leak that answer shows: 'stack-trace', 'db-error', 'secret', 'debug'.
 export function scanResponse({ status = 200, contentType = '', body = '' } = {}) {
   try {

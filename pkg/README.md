@@ -177,6 +177,19 @@ seen. What it has learned can be written down for your code: `guard.schema.zod()
 Try a rule on real traffic before it is allowed to refuse anybody: `createGuard({ shield: { shadow: ['sqli.union', 'xss'] } })`. A rule (or a
 whole family, without the dot) in shadow mode is evaluated and reported as "would have" but adds no points and never blocks.
 
+## What your AI feature says back
+
+Two things leave through an AI feature that nobody meant to give away: the instructions you wrote for the model and any secret that reached its context. `guard.aiOutput` reads the model's **answer** before you send it on:
+
+```js
+const canary = await guard.aiOutput.canary()          // put it inside your system prompt: `... (internal tag: ${canary})`
+const answer = await model.generate(...)
+const { text, kinds } = await guard.aiOutput.check(answer)   // kinds: 'prompt-leak', 'secret', 'card'
+return text                                                   // enforce mode: redacted; observe mode: unchanged
+```
+
+The canary comes from your key, so every instance of your server knows it without sharing state. Only the **kind** is reported to Bitora, never the answer. It catches a verbatim copy of your prompt (what most extraction attacks produce), not a paraphrase, and it cannot stop a model from being talked into saying something else harmful: it reads for leaks, it is not a content filter. Do not put secrets in a model's context in the first place.
+
 ## How much of your pages reaches the snippet
 
 The package counts the page navigations of browsers it sees (requests with Fetch Metadata `sec-fetch-dest: document` and `sec-fetch-mode: navigate`, not prefetches) and sends **only that number** with its event batches, no path, address or user. Bitora compares it with the page views the snippet reports and shows the share in the coverage of the site. It only counts the requests that go through the package: with a Next.js matcher limited to `/api/*` it sees no pages and the line says there is not enough data. Ad blockers and disabled JavaScript lower the share legitimately, so read it against your own normal, not against 100 %.

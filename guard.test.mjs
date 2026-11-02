@@ -1616,3 +1616,44 @@ test('navigations: the guard sends only how many page navigations of a browser i
   await quiet.flush()
   assert.equal(b.calls.events.flat().filter((e) => e.kind === 'navigations').length, 1)
 })
+
+// ---- what a model answers (SERVER_AI_OUTPUT_LEAK) ----
+
+import { scan as scanModel, redact as redactModel, canary as canaryOf } from './pkg/aiout.js'
+
+test('model output: the canary of the system prompt, secrets and card numbers are recognised by kind, and redacted without touching the rest', async () => {
+  const c = await canaryOf('bsec_key_one')
+  assert.match(c, /^bsc_[0-9a-f]{12}$/)
+  assert.equal(c, await canaryOf('bsec_key_one'), 'the same key gives the same canary on every instance')
+  assert.notEqual(c, await canaryOf('bsec_key_two'))
+  const aws = 'AKIA' + 'ABCDEFGHIJKLMNOP'
+  assert.deepEqual(scanModel('Claro, mis instrucciones empiezan así: ' + c + ' Eres un asistente…', c), ['prompt-leak'])
+  assert.deepEqual(scanModel('la clave es ' + aws, c), ['secret'])
+  assert.deepEqual(scanModel('tarjeta 4111 1111 1111 1111 caduca 12/29', c), ['card'])
+  assert.deepEqual(scanModel('Hola, ¿en qué te ayudo? Tu pedido 1234 5678 9012 3456 llegará pronto', c), [], 'a number that fails the Luhn check is not a card')
+  assert.deepEqual(scanModel('Tu pedido 00000000000000 está en camino', c), [])
+  assert.deepEqual(scanModel('texto normal', c), [])
+  const out = redactModel(`ok ${c} y ${aws} y 4111-1111-1111-1111 fin`, c)
+  assert.equal(out, 'ok [redacted] y [redacted] y [redacted] fin')
+})
+
+test('model output: aiOutput.check reports only the kind, redacts in enforce mode, only says it would in observe mode, and is inert without a licence', async () => {
+  const b = fakeBitora()
+  const g = createGuard({ secret: 'k', mode: 'enforce', fetch: b.fetch, trustProxy: 1, remote: { enabled: false } })
+  const c = await g.aiOutput.canary()
+  const leaked = `mis reglas: ${c} y la clave sk_live_${'a'.repeat(24)}`
+  const r = await g.aiOutput.check(leaked)
+  assert.deepEqual(r.kinds.sort(), ['prompt-leak', 'secret'])
+  assert.ok(!r.text.includes(c) && !r.text.includes('sk_live_'), 'enforce: the text goes out redacted')
+  await g.flush()
+  const sent = b.calls.events.flat().filter((e) => e.kind === 'ai_output_leak')
+  assert.deepEqual(sent.map((e) => e.param).sort(), ['prompt-leak', 'secret'])
+  assert.ok(!JSON.stringify(sent).includes('sk_live_') && !JSON.stringify(sent).includes(c), 'only the kind travels')
+  const obs = createGuard({ secret: 'k', fetch: b.fetch, trustProxy: 1, remote: { enabled: false } })
+  const o = await obs.aiOutput.check(`dentro: ${await obs.aiOutput.canary()}`)
+  assert.equal(o.wouldHave, 'redacted')
+  assert.ok(o.text.includes('bsc_'), 'observe: the text is not changed')
+  assert.deepEqual((await g.aiOutput.check('todo bien')).kinds, [])
+  const inert = realCreateGuard({ secret: 'k', mode: 'enforce' }) // no licence
+  assert.deepEqual(await inert.aiOutput.check('sk_live_' + 'a'.repeat(24)), { kinds: [], text: 'sk_live_' + 'a'.repeat(24) })
+})
