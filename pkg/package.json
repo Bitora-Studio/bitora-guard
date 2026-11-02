@@ -1,6 +1,6 @@
 {
   "name": "@bitora/guard",
-  "version": "3.1.0",
+  "version": "3.1.1",
   "description": "Protection that runs on your own server: rate limits, an AI-spend budget, and detections that read the answers (brute force, credential stuffing, scans, id sweeps). Reports to Bitora Security. Fail-open.",
   "type": "module",
   "main": "./index.js",
