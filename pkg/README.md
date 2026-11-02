@@ -157,6 +157,21 @@ In `observe` a sink never throws: it lets the call through and reports the NAME 
 `BlockedSinkError`; `pick` always drops the extra fields, which is the fix, and reports their names. Parameterised queries remain the right
 fix for SQL: `sink.sql` is for the places where you still build it as text.
 
+## Leaks in your own answers
+
+`bitoraExpress(guard, { leaks: true })` reads the first 16 KB of each text answer your server sends and reports when it shows a **stack trace, a
+database error, a secret (a Stripe or AWS key, a private key, the Supabase service role key, a connection string with its password) or a debug
+page**. Only the KIND of leak and the route are reported, never the text. It wraps `res.write` and `res.end` (without changing what the client
+receives), which is why it is off by default. For other frameworks pass the body yourself: `guard.observe(req, { status, body, contentType })`.
+
+## Learning what each route receives
+
+`createGuard({ learn: { enabled: true } })` learns, per route, which top-level JSON fields arrive (names and types, never values) and which methods
+are used. Once it has seen enough, it reports a **field nobody sends** (the shape of a mass-assignment attempt: `role`, `is_admin`, `price`), a
+**field that changes type** (a string that is suddenly an object: a NoSQL operator) and a **method the route never saw**. It blocks nothing, and it
+never learns from a request it flagged. Turn it on after a few days of ordinary traffic; a legitimate new optional field looks odd until it is
+seen. What it has learned can be written down for your code: `guard.schema.zod()` (strict Zod schemas) and `guard.schema.openapi()`.
+
 ## Shadow rules
 
 Try a rule on real traffic before it is allowed to refuse anybody: `createGuard({ shield: { shadow: ['sqli.union', 'xss'] } })`. A rule (or a

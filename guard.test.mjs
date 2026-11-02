@@ -1280,3 +1280,143 @@ test('without a licence the sinks do nothing', () => {
   assert.equal(sinks.filterValue('a,b'), 'a,b')
   assert.deepEqual(sinks.pick({ role: 'x' }, ['name']), { role: 'x' })
 })
+
+// ---- leaks in the answers (G6) ----
+import { scanResponse, collector } from './pkg/leaks.js'
+
+test('leaks: a stack trace, a database error, a secret and a debug page are recognised; ordinary answers are not', () => {
+  const nodeTrace = "Error: boom\n    at handler (/app/src/orders.js:41:11)\n    at Layer.handle [as handle_request] (/app/node_modules/express/lib/router/layer.js:95:5)\n    at next (/app/node_modules/express/lib/router/route.js:149:13)"
+  const jwt = (p) => 'eyJhbGciOiJIUzI1NiJ9.' + Buffer.from(JSON.stringify(p)).toString('base64url') + '.c2lnbmF0dXJlLXNpZw'
+  const kinds = (body, extra = {}) => scanResponse({ status: 500, contentType: 'text/html', body, ...extra })
+  assert.deepEqual(kinds(nodeTrace), ['stack-trace'])
+  assert.deepEqual(kinds('Traceback (most recent call last):\n  File "app.py", line 3, in <module>'), ['stack-trace'])
+  assert.deepEqual(kinds('{"error":"duplicate key value violates unique constraint \\"users_email_key\\""}', { contentType: 'application/json' }), ['db-error'])
+  assert.deepEqual(kinds('You have an error in your SQL syntax; check the manual'), ['db-error'])
+  assert.deepEqual(kinds('{"message":"relation \\"orders\\" does not exist"}', { contentType: 'application/json' }), ['db-error'])
+  assert.ok(kinds('key: sk_live_' + 'a'.repeat(24)).includes('secret'))
+  assert.ok(kinds('DATABASE_URL=postgres://admin:hunter2@db.internal:5432/app').includes('secret'))
+  assert.ok(kinds('{"key":"' + jwt({ role: 'service_role', ref: 'abcdefghij' }) + '"}').includes('secret'), 'the service role key of Supabase')
+  assert.ok(!kinds('{"token":"' + jwt({ role: 'anon', ref: 'abcdefghij' }) + '"}').includes('secret'), 'the anon key is public by design')
+  assert.ok(kinds('<title>Werkzeug Debugger</title>').includes('debug'))
+  // what must stay quiet
+  for (const ok of ['{"ok":true,"items":[1,2,3]}', '<html><body><h1>Welcome</h1><p>at the end of the day (we) ship</p></body></html>', 'Read how to understand a stack trace and a SQL syntax guide', '{"token":"abc","error":"invalid password"}', '']) {
+    assert.deepEqual(kinds(ok), [], 'ordinary: ' + ok.slice(0, 40))
+  }
+  assert.deepEqual(scanResponse({ status: 200, contentType: 'image/png', body: nodeTrace }), [], 'only text answers are read')
+  assert.ok(!JSON.stringify(kinds(nodeTrace)).includes('/app/src'), 'only the kind comes back, never the text')
+})
+
+test('leaks: the collector keeps only the first bytes of a long answer', () => {
+  const c = collector(100)
+  c.add('a'.repeat(80))
+  c.add(Buffer.from('b'.repeat(80)))
+  c.add(undefined)
+  assert.equal(c.text().length, 100)
+})
+
+test('leaks: observe() reports the kind when it is given the body, and nothing when it is not', async () => {
+  const { guard, sent } = watched()
+  const r = req('/api/orders/7?token=abc')
+  guard.observe(r, { status: 500, contentType: 'text/html', body: 'Traceback (most recent call last):\n  File "x.py"' })
+  guard.observe(req('/api/health'), { status: 200 })
+  guard.observe(req('/api/ok'), { status: 200, contentType: 'application/json', body: '{"ok":true}' })
+  await guard.flush()
+  const leaks = sent.filter((e) => e.kind === 'response_leak')
+  assert.equal(leaks.length, 1, JSON.stringify(sent))
+  assert.equal(leaks[0].param, 'stack-trace')
+  assert.ok(!JSON.stringify(leaks[0]).includes('token=abc'), 'the query string never leaves')
+})
+
+test('leaks: the Express adapter reads the first bytes of the answer only when asked to, and never changes it', async () => {
+  for (const leaks of [false, true]) {
+    const { guard, sent } = watched()
+    const mw = bitoraExpress(guard, { leaks })
+    const handlers = {}
+    const written = []
+    const res = { statusCode: 500, on: (e, f) => (handlers[e] = f), setHeader() {}, getHeader: () => 'text/html', write(c) { written.push(c); return true }, end(c) { if (c) written.push(c) } }
+    const request = { method: 'GET', originalUrl: '/api/orders/7', url: '/api/orders/7', headers: { 'x-forwarded-for': '5.5.5.5' }, socket: { remoteAddress: '10.0.0.2' } }
+    await new Promise((resolve) => mw(request, res, resolve))
+    assert.equal(res.write('Traceback (most recent call last):\n'), true, 'the return value of write is kept')
+    res.end('  File "app.py", line 3')
+    handlers.finish()
+    await guard.flush()
+    assert.deepEqual(written, ['Traceback (most recent call last):\n', '  File "app.py", line 3'], 'the answer reaches the client untouched')
+    assert.equal(sent.some((e) => e.kind === 'response_leak'), leaks, 'off by default, on when asked')
+  }
+})
+
+// ---- schema learning (G7) ----
+import { createSchema } from './pkg/schema.js'
+
+test('schema: after enough ordinary traffic it notices an extra field, a field that changes type and a new method', () => {
+  let t = 10_000_000_000 // a real clock is far past the first hour of 1970
+  const s = createSchema({ minSamples: 5, now: () => t })
+  const ok = (body, status = 200, method = 'POST') => s.observe({ method, tpl: '/api/profile', body, status })
+  for (let i = 0; i < 6; i++) assert.deepEqual(ok({ name: 'Ana', email: 'a@x.co', age: 30 }), [], 'ordinary traffic is learned, not flagged')
+  assert.deepEqual(ok({ name: 'Ana', email: 'a@x.co', is_admin: true }), [{ kind: 'field', name: 'is_admin' }], 'a field nobody sends')
+  assert.deepEqual(ok({ name: { $ne: null }, email: 'a@x.co' }), [{ kind: 'type', name: 'name' }], 'a string that is an object: a NoSQL operator')
+  assert.deepEqual(ok({ name: 'Ana' }, 200, 'DELETE'), [{ kind: 'method', name: 'DELETE' }], 'a method the route never saw')
+  // the same anomaly is not repeated within the hour, and comes back after it
+  assert.deepEqual(ok({ name: 'x', is_admin: true }), [])
+  t += 3601 * 1000
+  assert.equal(ok({ name: 'x', is_admin: true }).length, 1)
+})
+
+test('schema: it does not learn what it flagged, nor what the app refused, and it is quiet before it has enough samples', () => {
+  const s = createSchema({ minSamples: 3 })
+  assert.deepEqual(s.observe({ method: 'POST', tpl: '/x', body: { a: 1, evil: 1 }, status: 200 }), [], 'not enough samples yet')
+  for (let i = 0; i < 3; i++) s.observe({ method: 'POST', tpl: '/y', body: { a: 1 }, status: 200 })
+  s.observe({ method: 'POST', tpl: '/y', body: { a: 1, evil: 1 }, status: 200 }) // flagged: must not be learned
+  assert.ok(!s.export().routes.find((r) => r.path === '/y').fields.some((f) => f.name === 'evil'))
+  for (let i = 0; i < 5; i++) s.observe({ method: 'POST', tpl: '/z', body: { a: 1, bad: 2 }, status: 400 }) // refused: not learned
+  assert.equal(s.export().routes.find((r) => r.path === '/z'), undefined)
+})
+
+test('schema: only names and types are kept, memory is bounded, and the exports describe what was learned', () => {
+  const s = createSchema({ minSamples: 2, maxRoutes: 3 })
+  for (let i = 0; i < 4; i++) {
+    const body = { title: 'a secret title', qty: 2, tags: ['x'] }
+    if (i % 2) body.note = 'n' // an optional field: a JSON body simply does not have it the other times
+    s.observe({ method: 'POST', tpl: '/api/items', body, status: 201 })
+  }
+  const out = s.export()
+  assert.ok(!JSON.stringify(out).includes('a secret title'), 'no value is kept')
+  const route = out.routes[0]
+  assert.equal(route.samples, 4)
+  assert.deepEqual(route.fields.find((f) => f.name === 'qty'), { name: 'qty', types: ['number'], required: true })
+  assert.equal(route.fields.find((f) => f.name === 'note').required, false)
+  const oa = s.openapi()
+  assert.equal(oa.paths['/api/items'].post.requestBody.content['application/json'].schema.properties.qty.type, 'number')
+  const zod = s.zod()
+  assert.match(zod, /"POST \/api\/items": z\.object\(\{/)
+  assert.match(zod, /"qty": z\.number\(\)/)
+  assert.match(zod, /"note": z\.string\(\)\.optional\(\)/)
+  for (let i = 0; i < 10; i++) s.observe({ method: 'POST', tpl: '/r' + i, body: { a: 1 }, status: 200 })
+  assert.ok(s.export().routes.length <= 3, 'the number of routes is bounded')
+})
+
+test('schema: the guard reports an unexpected field only when learning is on, and only the name travels', async () => {
+  for (const enabled of [false, true]) {
+    const { guard, sent } = watched({ learn: { enabled, minSamples: 3 } })
+    const post = (body) => guard.observe({ method: 'POST', originalUrl: '/api/profile', url: '/api/profile', headers: { 'x-forwarded-for': '5.5.5.5' }, socket: { remoteAddress: '10.0.0.2' } }, { status: 200, requestBody: body })
+    for (let i = 0; i < 4; i++) post({ name: 'Ana' })
+    post({ name: 'Ana', role: 'admin', secretvalue: 'hunter2' })
+    await guard.flush()
+    const hits = sent.filter((e) => e.kind === 'unexpected_input')
+    assert.equal(hits.length > 0, enabled, 'off by default')
+    if (enabled) {
+      assert.ok(hits.every((h) => /^field\.[a-z_]+$/.test(h.param)), JSON.stringify(hits))
+      assert.ok(!JSON.stringify(hits).includes('hunter2'), 'a value never travels')
+    }
+  }
+})
+
+test('schema: repeating an attack does not teach the guard that it is normal', () => {
+  let t = 10_000_000_000
+  const s = createSchema({ minSamples: 3, now: () => t })
+  for (let i = 0; i < 4; i++) s.observe({ method: 'POST', tpl: '/api/p', body: { name: 'a' }, status: 200 })
+  for (let i = 0; i < 20; i++) s.observe({ method: 'POST', tpl: '/api/p', body: { name: 'a', role: 'admin' }, status: 200 }) // reported once, then silent
+  assert.ok(!s.export().routes[0].fields.some((f) => f.name === 'role'), 'the field was never learned')
+  t += 4000 * 1000
+  assert.equal(s.observe({ method: 'POST', tpl: '/api/p', body: { name: 'a', role: 'admin' }, status: 200 }).length, 1, 'and it is reported again after the hour')
+})

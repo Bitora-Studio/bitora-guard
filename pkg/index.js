@@ -5,6 +5,8 @@
 
 import { createDetector, isTrap, jsonShape, template } from './detect.js'
 import { createLicense } from './license.js'
+import { scanResponse } from './leaks.js'
+import { createSchema } from './schema.js'
 import { createShield } from './shield.js'
 import { memoryStore } from './store.js'
 
@@ -45,6 +47,9 @@ const DEFAULTS = {
   // threshold points (CRS: critical 5). paranoia 2 adds rules that catch more and are wrong more often.
   // exclusions: [{ match: '/api/posts', params: ['body.markdown'], rules: ['xss'] }] silence a rule on a route or parameter.
   shield: { enabled: true, block: true, paranoia: 1, threshold: 5, exclusions: [] },
+  // Learn what each route normally receives and notice what does not fit (a field nobody sends, a field that changes type, a new method). Off by
+  // default: turn it on after a few days of ordinary traffic. See schema.js.
+  learn: { enabled: false, minSamples: 30 },
   // Budgets for business flows that cost money or can be abused (SMS, checkout, coupons), by name:
   // flows: { sms_send: { perUser: { max: 3, windowSec: 3600 }, perIp: { max: 10, windowSec: 3600 }, global: { max: 500, windowSec: 86400 } } }
   flows: {},
@@ -115,7 +120,7 @@ const PRIVATE_IP = /^(10\.|127\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.
 
 function merge(base, extra = {}) {
   const out = { ...base, ...extra }
-  for (const k of ['rateLimit', 'bots', 'remote', 'report', 'ai', 'signup', 'login', 'traps', 'csrf', 'limits', 'shield', 'breach', 'decide']) out[k] = { ...base[k], ...(extra[k] || {}) }
+  for (const k of ['rateLimit', 'bots', 'remote', 'report', 'ai', 'signup', 'login', 'traps', 'csrf', 'limits', 'shield', 'breach', 'decide', 'learn']) out[k] = { ...base[k], ...(extra[k] || {}) }
   return out
 }
 
@@ -213,6 +218,7 @@ export function createGuard(options = {}) {
   // traffic through and reports nothing. options.__license is only for this package's own tests.
   const lic = options.__license || createLicense({ secret: o.secret, apiUrl: o.apiUrl, fetch: doFetch, now, token: options.license, publicKey: options.__licensePublicKey })
   const windows = new Windows()
+  const learned = createSchema({ minSamples: o.learn.minSamples, now })
   const detector = createDetector({ now, detect: o.detect })
   const shield = createShield(o.shield)
 
@@ -501,6 +507,20 @@ export function createGuard(options = {}) {
         if (ok || failed) found.push(...detector.auth({ ip: r.ip, account: a.account, ok, unknownUser: a.reason === 'unknown_user', path: template(r.path).template }))
       }
       found.push(...detector.response({ ip: r.ip, path: r.path, status, method: r.method, user, id: a.id }))
+      // What does not fit what this route normally receives (names and types only; it never blocks).
+      if (o.learn.enabled) {
+        const tpl = template(r.path).template
+        const bodyIn = a.requestBody !== undefined ? a.requestBody : req && typeof req === 'object' && !(typeof Request !== 'undefined' && req instanceof Request) ? req.body : undefined
+        for (const an of learned.observe({ method: r.method, tpl, body: bodyIn, status })) {
+          found.push({ rule: 'unexpected_input', ip: '', path: tpl, count: 1, windowSec: 0, points: 0, param: an.kind + '.' + learned.safeName(an.name) })
+        }
+      }
+      // What the answer itself gives away (a stack trace, a database error, a secret, a debug page). It blames nobody and carries only the kind.
+      if (a.body !== undefined) {
+        for (const kind of scanResponse({ status, contentType: a.contentType, body: a.body })) {
+          found.push({ rule: 'response_leak', ip: '', path: template(r.path).template, count: 1, windowSec: 0, points: 0, param: kind })
+        }
+      }
       applyFindings(found, r.ipSource)
     } catch {
       /* the answer has already gone out: nothing to do */
@@ -875,6 +895,12 @@ export function createGuard(options = {}) {
     signup: (a) => (lic.usable() ? signup(a) : { action: 'allow', reasons: [] }),
     // The state of the licence: 'active', 'inactive' (with the reason: subscription_required, bad_key, no_key, unreachable) or 'checking'.
     license: { status: lic.status, reason: lic.reason, ready: lic.ready },
+    // What the guard has learned about your routes (names and types, never values), as data, as an OpenAPI document or as Zod schemas.
+    schema: {
+      export: () => (lic.usable() ? learned.export() : { routes: [] }),
+      openapi: () => (lic.usable() ? learned.openapi() : { openapi: '3.0.3', info: { title: 'inactive', version: '0' }, paths: {} }),
+      zod: () => (lic.usable() ? learned.zod() : ''),
+    },
     licensed: lic.usable,
     options: o,
   }

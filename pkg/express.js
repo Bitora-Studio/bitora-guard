@@ -5,14 +5,40 @@
 //   app.use(express.json())   // before the guard, so the account of a login can be counted (it never leaves your server)
 //   app.use(bitoraExpress(createGuard({ secret: process.env.BITORA_SECRET, mode: 'enforce', login: { paths: ['/api/login'] } })))
 //
+import { collector } from './leaks.js'
+
 // Besides gating each request, it watches the answer (res "finish") to see failed logins, scans and id sweeps.
 
-export function bitoraExpress(guard) {
+// bitoraExpress(guard, { leaks: true }) also reads the first 16 KB of each text answer to notice a stack trace, a database error, a secret or
+// a debug page that your server is sending out (only the KIND is reported). It wraps res.write and res.end, which is why it is off by default.
+export function bitoraExpress(guard, { leaks = false } = {}) {
   return function bitora(req, res, next) {
+    const seen = leaks ? collector() : null
+    if (seen && typeof res.write === 'function' && typeof res.end === 'function') {
+      const write = res.write
+      const end = res.end
+      res.write = function (chunk, ...rest) {
+        try {
+          seen.add(chunk)
+        } catch {
+          /* never affect the answer */
+        }
+        return write.call(this, chunk, ...rest)
+      }
+      res.end = function (chunk, ...rest) {
+        try {
+          seen.add(chunk)
+        } catch {
+          /* never affect the answer */
+        }
+        return end.call(this, chunk, ...rest)
+      }
+    }
     if (typeof res.on === 'function') res.on('finish', () => {
       try {
         const account = guard.accountOf(req.body)
-        guard.observe(req, { status: res.statusCode, account, user: req.user?.id ?? req.userId })
+        const type = typeof res.getHeader === 'function' ? String(res.getHeader('content-type') || '') : ''
+        guard.observe(req, { status: res.statusCode, account, user: req.user?.id ?? req.userId, ...(seen ? { body: seen.text(), contentType: type } : {}) })
       } catch {
         /* observing never affects the answer */
       }
