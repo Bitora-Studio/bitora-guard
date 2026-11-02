@@ -1420,3 +1420,81 @@ test('schema: repeating an attack does not teach the guard that it is normal', (
   t += 4000 * 1000
   assert.equal(s.observe({ method: 'POST', tpl: '/api/p', body: { name: 'a', role: 'admin' }, status: 200 }).length, 1, 'and it is reported again after the hour')
 })
+
+// ---- circuit breaker and off switch ----
+
+import { createBreaker } from './pkg/breaker.js'
+
+test('breaker: opens after consecutive failures, lets one probe through after the pause, doubles the pause on a failed probe and closes on success', () => {
+  let t = 1_000_000
+  const b = createBreaker({ now: () => t, threshold: 3, baseMs: 1000, maxMs: 4000 })
+  for (let i = 0; i < 2; i++) {
+    assert.ok(b.allow())
+    b.fail()
+  }
+  assert.equal(b.state(), 'closed', 'two failures are not enough')
+  assert.ok(b.allow())
+  b.fail()
+  assert.equal(b.state(), 'open')
+  assert.equal(b.allow(), false, 'open: nobody asks')
+  t += 1001
+  assert.ok(b.allow(), 'the pause is over: one probe')
+  assert.equal(b.allow(), false, 'only one probe at a time')
+  b.fail()
+  t += 1500
+  assert.equal(b.allow(), false, 'the pause doubled to 2 s')
+  t += 600
+  assert.ok(b.allow())
+  b.ok()
+  assert.equal(b.state(), 'closed')
+  assert.ok(b.allow() && b.allow(), 'closed again: everybody asks')
+  for (let i = 0; i < 20; i++) {
+    b.fail()
+    t += 10_000
+    b.allow()
+  }
+  b.fail()
+  const before = t
+  t += 4001
+  assert.ok(b.allow(), 'the pause never grows past maxMs')
+  assert.ok(t - before < 5000)
+})
+
+test('breaker: a Bitora that is down is asked a handful of times, not on every request, and the traffic is never held up', async () => {
+  const b = fakeBitora({ fail: true })
+  const g = createGuard({ secret: 'k', mode: 'enforce', fetch: b.fetch, remote: { mode: 'ip', blocking: true, timeoutMs: 50 } })
+  for (let i = 0; i < 40; i++) assert.equal((await g.check(req('/', { ip: '198.51.100.' + (i + 1) }))).action, 'allow')
+  assert.ok(b.calls.checks.length === 0, 'failed calls are not recorded as checks')
+  let asked = 0
+  const counting = async (...a) => {
+    asked++
+    throw new Error('down')
+  }
+  const g2 = createGuard({ secret: 'k', mode: 'enforce', fetch: counting, remote: { mode: 'ip', blocking: true, timeoutMs: 50 }, report: { enabled: false } })
+  for (let i = 0; i < 40; i++) assert.equal((await g2.check(req('/', { ip: '198.51.100.' + (i + 1) }))).action, 'allow')
+  assert.ok(asked <= 6, 'five failures open the breaker; the rest do not ask (asked ' + asked + ')')
+  const d = await g2.decide('signup', { email: 'a@b.example' })
+  assert.equal(d.checked, false)
+  assert.ok(asked <= 6, 'decide shares the breaker')
+})
+
+test('off switch: options.disabled and BITORA_GUARD_DISABLED make the package inert, with nothing sent to Bitora', async () => {
+  const b = fakeBitora({ action: 'block' })
+  let off = true
+  const g = createGuard({ secret: 'k', mode: 'enforce', fetch: b.fetch, disabled: () => off, remote: { mode: 'ip', blocking: true } })
+  assert.equal((await g.check(req('/wp-admin/setup-config.php'))).action, 'allow', 'a trap would be blocked, but the package is off')
+  assert.equal(g.inspect({ method: 'GET', path: '/', ip: '8.8.8.8' }, 'x', 1), null)
+  assert.deepEqual(await g.decide('signup', { email: 'a@b.example' }), { action: 'allow', reasons: [], checked: false })
+  await g.flush()
+  assert.equal(b.calls.checks.length + b.calls.events.length, 0, 'nothing was asked or reported while it was off')
+  off = false
+  assert.equal((await g.check(req('/wp-admin/setup-config.php'))).action, 'block', 'and it works again when switched on, without a restart')
+
+  process.env.BITORA_GUARD_DISABLED = '1'
+  try {
+    const g2 = createGuard({ secret: 'k', mode: 'enforce', fetch: b.fetch })
+    assert.equal((await g2.check(req('/wp-admin/setup-config.php'))).action, 'allow')
+  } finally {
+    delete process.env.BITORA_GUARD_DISABLED
+  }
+})

@@ -177,6 +177,17 @@ seen. What it has learned can be written down for your code: `guard.schema.zod()
 Try a rule on real traffic before it is allowed to refuse anybody: `createGuard({ shield: { shadow: ['sqli.union', 'xss'] } })`. A rule (or a
 whole family, without the dot) in shadow mode is evaluated and reported as "would have" but adds no points and never blocks.
 
+## When Bitora does not answer, and the off switch
+
+Everything the package asks of Bitora (the list of blocked addresses, per-address checks, `guard.decide`, the event batches) goes through
+one circuit breaker. After five failures in a row it stops asking for 5 seconds, then lets one call through to see whether Bitora is back;
+each failed probe doubles the pause (up to 5 minutes) and one answer closes the breaker. Meanwhile the traffic goes through and what was
+seen waits to be sent. Your site never waits on ours.
+
+To turn the package off completely (nothing inspected, limited or sent; the site behaves as if it were not installed) set
+`BITORA_GUARD_DISABLED=1`, or pass `createGuard({ disabled: () => myFlag() })` to read your own flag on every call. `guard.license.status()`
+then says `disabled`.
+
 ## Licence and subscription
 
 From 3.0 this package works for the sites of a Bitora Security subscriber. At start it asks Bitora for a licence with the API key of your site

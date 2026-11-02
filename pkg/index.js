@@ -4,6 +4,7 @@
 // site stays up. In "observe" mode (the default) it never blocks anything: it only reports what it would have done.
 
 import { createDetector, isTrap, jsonShape, template } from './detect.js'
+import { createBreaker } from './breaker.js'
 import { createLicense } from './license.js'
 import { scanResponse } from './leaks.js'
 import { createSchema } from './schema.js'
@@ -216,7 +217,23 @@ export function createGuard(options = {}) {
   const doFetch = options.fetch || globalThis.fetch
   // The licence: this package works for a site of a Bitora Security subscriber (see license.js). Without one every call below lets the
   // traffic through and reports nothing. options.__license is only for this package's own tests.
-  const lic = options.__license || createLicense({ secret: o.secret, apiUrl: o.apiUrl, fetch: doFetch, now, token: options.license, publicKey: options.__licensePublicKey })
+  const realLic = options.__license || createLicense({ secret: o.secret, apiUrl: o.apiUrl, fetch: doFetch, now, token: options.license, publicKey: options.__licensePublicKey })
+  // The off switch: options.disabled (true, or a function that says so) or BITORA_GUARD_DISABLED=1 in the environment. Nothing is inspected,
+  // limited, reported or asked to Bitora while it is on, and the site behaves as if the package were not installed. It is read on every call, so
+  // a runtime that lets you change the variable (or a function that reads your own flag) turns the package off without a deploy.
+  const procEnv = typeof process !== 'undefined' && process.env ? process.env : {}
+  const killed = () => {
+    const d = typeof options.disabled === 'function' ? options.disabled() : options.disabled
+    return d === true || /^(1|true|yes)$/i.test(String(procEnv.BITORA_GUARD_DISABLED || ''))
+  }
+  const lic = {
+    usable: () => !killed() && realLic.usable(),
+    ready: async () => !killed() && (await realLic.ready()),
+    status: () => (killed() ? 'disabled' : realLic.status()),
+    reason: () => (killed() ? 'Desactivado con BITORA_GUARD_DISABLED u options.disabled' : realLic.reason()),
+  }
+  // One breaker for everything that talks to Bitora: if it does not answer, the package stops asking for a while (see breaker.js).
+  const breaker = options.__breaker || createBreaker({ now })
   const windows = new Windows()
   const learned = createSchema({ minSamples: o.learn.minSamples, now })
   const detector = createDetector({ now, detect: o.detect })
@@ -290,7 +307,7 @@ export function createGuard(options = {}) {
 
   // Sends what has been seen as one batch. Never awaited by a request and never throws: reporting must not slow a page.
   function flush() {
-    if (!events.size || !o.secret || !doFetch) return Promise.resolve()
+    if (!events.size || !o.secret || !doFetch || !breaker.allow()) return Promise.resolve() // while Bitora does not answer, what was seen waits
     const batch = [...events.values()].slice(0, 100)
     events = new Map()
     lastFlush = now()
@@ -301,14 +318,16 @@ export function createGuard(options = {}) {
         body: JSON.stringify({ events: batch }),
         keepalive: true,
       }),
-    ).catch(() => {})
+    )
+      .then((res) => (res && res.ok === false ? breaker.fail() : breaker.ok()))
+      .catch(() => breaker.fail())
   }
 
   // The addresses Bitora wants blocked, downloaded in the background and checked in memory. If Bitora does not answer,
   // the list already held keeps working until each entry expires, and nothing new is blocked (fail-open).
   const list = { map: new Map(), mode: 'observe', at: 0, busy: false, etag: '' }
   async function refreshList() {
-    if (list.busy) return
+    if (list.busy || !breaker.allow()) return
     list.busy = true
     const ctl = typeof AbortController === 'function' ? new AbortController() : null
     const timer = ctl ? setTimeout(() => ctl.abort(), 3000) : null
@@ -317,6 +336,7 @@ export function createGuard(options = {}) {
       if (list.etag) headers['if-none-match'] = list.etag // an unchanged list costs an empty 304
       const res = await doFetch(o.apiUrl + '/api/v1/decisions/active', { headers, signal: ctl?.signal })
       if (res.status === 304) {
+        breaker.ok()
         list.at = now()
         return
       }
@@ -328,7 +348,9 @@ export function createGuard(options = {}) {
       list.map = next
       list.mode = d.mode || 'observe'
       list.at = now()
+      breaker.ok()
     } catch {
+      breaker.fail()
       list.at = now() - o.remote.refreshMs + 5000 // try again in a few seconds
     } finally {
       if (timer) clearTimeout(timer)
@@ -348,7 +370,7 @@ export function createGuard(options = {}) {
   async function remoteDecision(ip) {
     const hit = cache.get(ip)
     if (hit && hit.until > now()) return hit
-    if (!o.remote.enabled || !o.secret || !doFetch || PRIVATE_IP.test(ip) || pending.has(ip)) return hit || null
+    if (!o.remote.enabled || !o.secret || !doFetch || PRIVATE_IP.test(ip) || pending.has(ip) || !breaker.allow()) return hit || null
     const ask = async () => {
       pending.add(ip)
       const ctl = typeof AbortController === 'function' ? new AbortController() : null
@@ -362,8 +384,10 @@ export function createGuard(options = {}) {
         const d = await res.json()
         const entry = { action: d.action || 'allow', siteMode: d.mode || 'observe', until: now() + Math.min(Math.max(1, d.ttl || 60) * 1000, o.remote.cacheMs) }
         cache.set(ip, entry)
+        breaker.ok()
         return entry
       } catch {
+        breaker.fail()
         // Fail-open: Bitora did not answer, so the request is let through; do not ask again for a few seconds.
         const entry = { action: 'allow', siteMode: 'observe', until: now() + 5000 }
         cache.set(ip, entry)
@@ -805,7 +829,7 @@ export function createGuard(options = {}) {
   // for an account (guard.accountOf), never its name. Short timeout, and if Bitora does not answer the result is allow.
   async function decide(kind, a = {}) {
     try {
-      if (!o.secret || !doFetch) return { action: 'allow', reasons: [], checked: false }
+      if (!o.secret || !doFetch || !breaker.allow()) return { action: 'allow', reasons: [], checked: false }
       const x = addr(a)
       const ctl = typeof AbortController === 'function' ? new AbortController() : null
       const timer = ctl ? setTimeout(() => ctl.abort(), o.decide.timeoutMs) : null
@@ -818,6 +842,7 @@ export function createGuard(options = {}) {
         })
         if (!res.ok) throw new Error('status ' + res.status)
         const d = await res.json()
+        breaker.ok()
         if (d.action !== 'block') return { action: 'allow', reasons: [], checked: true }
         if (kind === 'signup') note('signup_blocked', { ip: x.ip, ipSource: x.ipSource, param: d.reasons?.[0], points: 3 })
         return enforcing()
@@ -827,6 +852,7 @@ export function createGuard(options = {}) {
         if (timer) clearTimeout(timer)
       }
     } catch {
+      breaker.fail()
       return { action: 'allow', reasons: [], checked: false }
     }
   }
