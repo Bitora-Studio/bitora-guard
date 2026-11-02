@@ -36,6 +36,19 @@ jobs:
             echo "tag ${GITHUB_REF_NAME} does not match package.json version ${v}" >&2
             exit 1
           fi
+      # The list of components of the package (CycloneDX), kept with the run. The package has no runtime dependencies, so it says so.
+      # A failure here must not stop a security fix from being published.
+      - name: SBOM
+        continue-on-error: true
+        working-directory: pkg
+        run: npm sbom --sbom-format cyclonedx --omit dev > ../guard-sbom.cdx.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        continue-on-error: true
+        with:
+          name: guard-sbom
+          path: guard-sbom.cdx.json
+          if-no-files-found: ignore
       - name: Publish
         working-directory: pkg
         env:
