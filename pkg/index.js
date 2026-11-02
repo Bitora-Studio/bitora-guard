@@ -5,6 +5,7 @@
 
 import { createDetector, isTrap, jsonShape, template } from './detect.js'
 import { createBreaker } from './breaker.js'
+import { cspHeaders, makeNonce, parseReports } from './csp.js'
 import { createLicense } from './license.js'
 import { scanResponse } from './leaks.js'
 import { createSchema } from './schema.js'
@@ -63,6 +64,9 @@ const DEFAULTS = {
   store: null,
   // guard.decide() asks Bitora for the few decisions that need a state shared by every instance (see the README).
   decide: { timeoutMs: 300 },
+  // guard.headers() and guard.reports(): where the browser sends what the report-only policy would have refused (a path of your own site),
+  // and how many reports one instance accepts per hour (anybody can post to that path, so what arrives is a hint, never proof).
+  csp: { reportPath: '/_bitora/r', maxPerHour: 200 },
 }
 
 // Mail domains that exist to receive one message and be thrown away. A short list of the best known ones, kept here so
@@ -121,7 +125,7 @@ const PRIVATE_IP = /^(10\.|127\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.
 
 function merge(base, extra = {}) {
   const out = { ...base, ...extra }
-  for (const k of ['rateLimit', 'bots', 'remote', 'report', 'ai', 'signup', 'login', 'traps', 'csrf', 'limits', 'shield', 'breach', 'decide', 'learn']) out[k] = { ...base[k], ...(extra[k] || {}) }
+  for (const k of ['rateLimit', 'bots', 'remote', 'report', 'ai', 'signup', 'login', 'traps', 'csrf', 'limits', 'shield', 'breach', 'decide', 'learn', 'csp']) out[k] = { ...base[k], ...(extra[k] || {}) }
   return out
 }
 
@@ -287,7 +291,7 @@ export function createGuard(options = {}) {
   function reportFinding(f, ipSource, action, wouldHave) {
     if (!o.report.enabled || !o.secret) return
     if (f.ip && PRIVATE_IP.test(f.ip)) return
-    const key = f.rule + '|' + (f.ip || '') + '|' + f.path
+    const key = f.rule + '|' + (f.ip || '') + '|' + f.path + '|' + (f.param || '') // two different things on one route are two events
     const e = { kind: f.rule, ip: f.ip || '', path: f.path || '/', count: f.count, window_s: f.windowSec, score: f.points, action, ip_source: ipSource || 'none' }
     if (wouldHave) e.would_have = true
     if (f.param) e.param = f.param
@@ -765,15 +769,44 @@ export function createGuard(options = {}) {
   // ---- things the app tells us about, outside any request ----
   // note(kind, { ip, ipSource, param, points }) reports an event of the app or of a sink (guardFetch, signup, flow). Kinds
   // other than these three are ignored. It never throws.
-  const NOTES = { ssrf_blocked: 0, signup_blocked: 3, flow_limited: 3, sink_blocked: 0 }
+  const NOTES = { ssrf_blocked: 0, signup_blocked: 3, flow_limited: 3, sink_blocked: 0, csp_violation: 0 }
   function note(kind, a = {}) {
     try {
       if (!(kind in NOTES)) return
       const x = addr(a)
       const points = a.points ?? NOTES[kind]
-      applyFindings([{ rule: kind, ip: x.ip, path: '/', count: 1, windowSec: 0, points, param: String(a.param || '').replace(/[^a-z0-9_.-]/gi, '').slice(0, 40) }], x.ipSource)
+      applyFindings([{ rule: kind, ip: x.ip, path: '/', count: 1, windowSec: 0, points, param: String(a.param || '').replace(/[^a-z0-9_.-]/gi, '').slice(0, kind === 'csp_violation' ? 80 : 40) }], x.ipSource)
     } catch {
       /* ignore */
+    }
+  }
+
+  // guard.reports(request): the receiver of the browser's CSP reports (see csp.js). Returns a Response when the request is one of them (a POST
+  // to options.csp.reportPath, always answered 204) and null for any other request, so an adapter can call it first. It reads at most 32 KB.
+  let reportsHour = { start: 0, n: 0 }
+  function takeReports(list) {
+    const t = now()
+    if (t - reportsHour.start >= 3600000) reportsHour = { start: t, n: 0 }
+    for (const r of list) {
+      if (reportsHour.n >= o.csp.maxPerHour) break
+      reportsHour.n++
+      note('csp_violation', { param: r.directive + '.' + r.blocked })
+    }
+  }
+  function isReportRequest(method, path) {
+    return String(method).toUpperCase() === 'POST' && path === o.csp.reportPath
+  }
+  async function reports(req, bodyText) {
+    try {
+      const r = describe(req, o)
+      if (!isReportRequest(r.method, r.path)) return null
+      if (r.contentLength > 32768) return new Response(null, { status: 204 })
+      let text = bodyText
+      if (text === undefined && typeof req.text === 'function') text = await req.text()
+      takeReports(parseReports(text || ''))
+      return new Response(null, { status: 204 })
+    } catch {
+      return new Response(null, { status: 204 })
     }
   }
 
@@ -809,10 +842,25 @@ export function createGuard(options = {}) {
   // (options.store). It spends 'amount' (default 1) and says whether the window is over max. In observe mode it only says what it would
   // have done. If the store does not answer it lets the request through.
   const store = o.store || memoryStore({ now })
+  const storeBreaker = createBreaker({ now }) // its own breaker: a slow Redis must not silence the calls to Bitora, nor the other way round
   async function limit(name, { key, max, windowSec = 60, amount = 1, ip, ipSource } = {}) {
     try {
       if (!/^[a-z0-9_.-]{1,40}$/.test(String(name)) || !key || !(max >= 1)) return { action: 'allow', allowed: true, count: 0, checked: false }
-      const r = await store.hit(String(name), String(key).slice(0, 128), { windowSec, amount, max })
+      if (!storeBreaker.allow()) return { action: 'allow', allowed: true, count: 0, checked: false } // the store is down: do not wait on it every time
+      let r
+      try {
+        let timer
+        const late = new Promise((_, no) => (timer = setTimeout(() => no(new Error('store timeout')), 500)))
+        try {
+          r = await Promise.race([store.hit(String(name), String(key).slice(0, 128), { windowSec, amount, max }), late])
+        } finally {
+          clearTimeout(timer)
+        }
+        storeBreaker.ok()
+      } catch (e) {
+        storeBreaker.fail()
+        throw e
+      }
       if (!(r.count > max)) return { action: 'allow', allowed: true, count: r.count, checked: true }
       note('flow_limited', { ip, ipSource, param: name })
       return enforcing()
@@ -927,6 +975,9 @@ export function createGuard(options = {}) {
       openapi: () => (lic.usable() ? learned.openapi() : { openapi: '3.0.3', info: { title: 'inactive', version: '0' }, paths: {} }),
       zod: () => (lic.usable() ? learned.zod() : ''),
     },
+    // headers(): a strict CSP, Trusted Types and Integrity-Policy as REPORT-ONLY, with a nonce for your scripts. Inert (no headers) without a licence.
+    headers: (a = {}) => (lic.usable() ? cspHeaders({ reportPath: o.csp.reportPath, ...a }) : { nonce: a.nonce || makeNonce(), headers: {} }),
+    reports: async (req, bodyText) => ((await lic.ready()) ? reports(req, bodyText) : isReportRequest(req.method, describe(req, o).path) ? new Response(null, { status: 204 }) : null),
     licensed: lic.usable,
     options: o,
   }

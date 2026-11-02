@@ -15,6 +15,8 @@ export function bitoraDeno(guard, handler) {
       method: req.method,
       socket: { remoteAddress: info?.remoteAddr?.hostname || '' },
     }
+    const report = await guard.reports(req)
+    if (report) return report
     const d = await guard.check(view)
     if (d.action !== 'allow') {
       return new Response(JSON.stringify({ error: d.reason || 'blocked' }), {

@@ -7,6 +7,8 @@
 
 export function bitoraHono(guard) {
   return async function bitora(c, next) {
+    const report = await guard.reports(c.req.raw)
+    if (report) return report
     let body
     try {
       const raw = c.req.raw

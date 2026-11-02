@@ -10,6 +10,8 @@
 
 export function bitoraMiddleware(guard, next) {
   return async function middleware(request, event) {
+    const report = await guard.reports(request) // the browser's CSP reports (see guard.headers()): answered here, never blocked
+    if (report) return report
     const d = await guard.check(request)
     if (d.action !== 'allow') {
       return new Response(JSON.stringify({ error: d.reason || 'blocked' }), {

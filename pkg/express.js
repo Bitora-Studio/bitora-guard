@@ -7,12 +7,36 @@
 //
 import { collector } from './leaks.js'
 
+// The browser's CSP reports (see guard.headers()) arrive as a POST that express.json() does not parse, so the body is read here, up to 32 KB.
+function receiveReports(guard, req, res) {
+  let text = ''
+  let size = 0
+  req.on('data', (c) => {
+    size += c.length
+    if (size <= 32768) text += c
+  })
+  req.on('end', async () => {
+    try {
+      await guard.reports(req, size <= 32768 ? text : '')
+    } catch {
+      /* a report never breaks the site */
+    }
+    res.statusCode = 204
+    res.end()
+  })
+  req.on('error', () => {
+    res.statusCode = 204
+    res.end()
+  })
+}
+
 // Besides gating each request, it watches the answer (res "finish") to see failed logins, scans and id sweeps.
 
 // bitoraExpress(guard, { leaks: true }) also reads the first 16 KB of each text answer to notice a stack trace, a database error, a secret or
 // a debug page that your server is sending out (only the KIND is reported). It wraps res.write and res.end, which is why it is off by default.
 export function bitoraExpress(guard, { leaks = false } = {}) {
   return function bitora(req, res, next) {
+    if (req.method === 'POST' && req.path === guard.options.csp.reportPath) return receiveReports(guard, req, res)
     const seen = leaks ? collector() : null
     if (seen && typeof res.write === 'function' && typeof res.end === 'function') {
       const write = res.write

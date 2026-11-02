@@ -1498,3 +1498,98 @@ test('off switch: options.disabled and BITORA_GUARD_DISABLED make the package in
     delete process.env.BITORA_GUARD_DISABLED
   }
 })
+
+test('limit: a shared store that is down or hangs is asked a few times and then skipped, and the request is never held up', async () => {
+  let asked = 0
+  const down = { hit: async () => { asked++; throw new Error('redis down') } }
+  const g = createGuard({ secret: 'k', mode: 'enforce', store: down })
+  for (let i = 0; i < 30; i++) assert.equal((await g.limit('coupon', { key: 'u' + i, max: 3 })).checked, false)
+  assert.ok(asked <= 5, 'five failures open the breaker (asked ' + asked + ')')
+  const hang = { hit: () => new Promise(() => {}) }
+  const g2 = createGuard({ secret: 'k', mode: 'enforce', store: hang })
+  const t0 = Date.now()
+  const r = await g2.limit('coupon', { key: 'u', max: 3 })
+  assert.equal(r.checked, false)
+  assert.ok(Date.now() - t0 < 1500, 'a hanging store is cut after half a second')
+})
+
+// ---- strict CSP as a trial (report-only) and the collector of its reports ----
+
+import { cspHeaders, parseReports } from './pkg/csp.js'
+
+test('headers: a strict CSP, Trusted Types and Integrity-Policy, always report-only and with a nonce for your scripts', () => {
+  const g = createGuard({ secret: 'k' })
+  const { nonce, headers } = g.headers()
+  assert.match(nonce, /^[A-Za-z0-9+/=]{16,}$/)
+  assert.deepEqual(Object.keys(headers).sort(), ['Content-Security-Policy-Report-Only', 'Integrity-Policy-Report-Only', 'Reporting-Endpoints'])
+  const csp = headers['Content-Security-Policy-Report-Only']
+  for (const part of [`script-src 'nonce-${nonce}' 'strict-dynamic'`, "object-src 'none'", "base-uri 'none'", "require-trusted-types-for 'script'", 'report-uri /_bitora/r', 'report-to bitora']) assert.ok(csp.includes(part), part)
+  assert.equal(headers['Reporting-Endpoints'], 'bitora="/_bitora/r"')
+  assert.ok(!('Content-Security-Policy' in headers), 'it never blocks: no enforcing header')
+  assert.notEqual(g.headers().nonce, nonce, 'a new nonce each time')
+  const custom = cspHeaders({ nonce: 'abcdEFGH12345678', reportPath: '/r', trustedTypes: false, integrity: false })
+  assert.ok(!custom.headers['Content-Security-Policy-Report-Only'].includes('trusted-types'))
+  assert.ok(!('Integrity-Policy-Report-Only' in custom.headers))
+  assert.throws(() => cspHeaders({ nonce: "x' 'unsafe-inline" }), TypeError, 'a nonce cannot carry other CSP words')
+  assert.throws(() => cspHeaders({ reportPath: 'https://evil.example/r' }), TypeError, 'reports go to a path of your own site')
+  const inert = realCreateGuard({ secret: 'k' }) // no licence: no headers, but the nonce still works in your templates
+  const h = inert.headers()
+  assert.deepEqual(h.headers, {})
+  assert.ok(h.nonce)
+})
+
+test('reports: both browser formats are reduced to the directive and the host, and nothing else is kept', () => {
+  const old = JSON.stringify({ 'csp-report': { 'document-uri': 'https://shop.example.com/pay?token=SECRET', 'violated-directive': "script-src-elem 'nonce-x'", 'effective-directive': 'script-src-elem', 'blocked-uri': 'https://cdn.evil.example/skim.js?k=1', 'script-sample': 'const card = document.querySelector', 'source-file': 'https://shop.example.com/a.js', 'line-number': 3 } })
+  const modern = JSON.stringify([
+    { type: 'csp-violation', body: { effectiveDirective: 'script-src-elem', blockedURL: 'inline', documentURL: 'https://shop.example.com/' } },
+    { type: 'csp-violation', body: { effectiveDirective: 'require-trusted-types-for', blockedURL: 'trusted-types-sink', sample: 'innerHTML|<img src=x>' } },
+    { type: 'network-error', body: {} },
+    { type: 'csp-violation', body: { effectiveDirective: 'script-src-elem', blockedURL: 'chrome-extension://abc/content.js' } },
+  ])
+  assert.deepEqual(parseReports(old), [{ directive: 'script-src-elem', blocked: 'cdn.evil.example' }])
+  assert.deepEqual(parseReports(modern), [{ directive: 'script-src-elem', blocked: 'inline' }, { directive: 'require-trusted-types-for', blocked: 'sink' }])
+  const all = JSON.stringify(parseReports(old)) + JSON.stringify(parseReports(modern))
+  for (const secret of ['SECRET', 'skim.js', 'document.querySelector', 'innerHTML', 'token']) assert.ok(!all.includes(secret), 'must not keep ' + secret)
+  assert.deepEqual(parseReports('not json'), [])
+  assert.deepEqual(parseReports('{"csp-report":{"effective-directive":"<script>","blocked-uri":"https://a.example/x"}}'), [])
+  assert.equal(parseReports(JSON.stringify(Array.from({ length: 50 }, () => ({ type: 'csp-violation', body: { effectiveDirective: 'script-src', blockedURL: 'inline' } })))).length, 20, 'at most 20 per post')
+})
+
+// The kind csp_violation becomes the rule CSP_REPORT_VIOLATION in the engine (internal/telemetry/guard.go).
+test('reports: the guard answers 204 to the browser, tells Bitora only the kind of violation, and lets every other request pass', async () => {
+  const b = fakeBitora()
+  const g = createGuard({ secret: 'k', fetch: b.fetch, trustProxy: 1, remote: { enabled: false } })
+  const post = (path, body, type = 'application/csp-report') => new Request('https://shop.example.com' + path, { method: 'POST', headers: { 'content-type': type, 'x-forwarded-for': '203.0.113.9' }, body })
+  const rep = JSON.stringify({ 'csp-report': { 'effective-directive': 'script-src-elem', 'blocked-uri': 'https://cdn.evil.example/skim.js', 'document-uri': 'https://shop.example.com/pay?t=1' } })
+  const res = await g.reports(post('/_bitora/r', rep))
+  assert.equal(res.status, 204)
+  assert.equal(await g.reports(new Request('https://shop.example.com/_bitora/r')), null, 'a GET is not a report')
+  assert.equal(await g.reports(post('/api/other', rep)), null, 'another path is not a report')
+  assert.equal((await g.reports(post('/_bitora/r', 'garbage'))).status, 204, 'garbage is answered and dropped')
+  await g.flush()
+  const sent = b.calls.events.flat()
+  assert.equal(sent.length, 1)
+  assert.equal(sent[0].kind, 'csp_violation')
+  assert.equal(sent[0].param, 'script-src-elem.cdn.evil.example')
+  assert.ok(!JSON.stringify(sent).includes('skim.js') && !JSON.stringify(sent).includes('t=1'), 'no script name, no query string')
+  // the adapters call it first
+  const mw = bitoraMiddleware(g)
+  assert.equal((await mw(post('/_bitora/r', rep))).status, 204)
+})
+
+test('reports: anybody can post to that path, so one instance accepts a limited number per hour', async () => {
+  const b = fakeBitora()
+  let t = 1_000_000_000_000
+  const g = createGuard({ secret: 'k', fetch: b.fetch, now: () => t, trustProxy: 1, remote: { enabled: false }, csp: { maxPerHour: 5 } })
+  for (let i = 0; i < 20; i++) {
+    const body = JSON.stringify({ 'csp-report': { 'effective-directive': 'script-src', 'blocked-uri': `https://h${i}.example/x.js` } })
+    await g.reports(new Request('https://s.example.com/_bitora/r', { method: 'POST', body, headers: { 'content-type': 'application/csp-report' } }))
+  }
+  await g.flush()
+  assert.equal(b.calls.events.flat().length, 5)
+  t += 3600_001
+  await g.reports(new Request('https://s.example.com/_bitora/r', { method: 'POST', body: JSON.stringify({ 'csp-report': { 'effective-directive': 'script-src', 'blocked-uri': 'https://again.example/x.js' } }), headers: { 'content-type': 'application/csp-report' } }))
+  t += 25_000
+  await g.flush()
+  assert.equal(b.calls.events.flat().length, 6, 'a new hour, a new allowance')
+})

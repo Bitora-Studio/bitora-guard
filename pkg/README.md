@@ -177,12 +177,24 @@ seen. What it has learned can be written down for your code: `guard.schema.zod()
 Try a rule on real traffic before it is allowed to refuse anybody: `createGuard({ shield: { shadow: ['sqli.union', 'xss'] } })`. A rule (or a
 whole family, without the dot) in shadow mode is evaluated and reported as "would have" but adds no points and never blocks.
 
+## A strict CSP, tried first (report-only)
+
+`guard.headers()` returns a nonce and the headers of a strict policy sent as **report-only**: `Content-Security-Policy-Report-Only` (`script-src` with your nonce and `strict-dynamic`, `object-src 'none'`, `base-uri 'none'`, Trusted Types for scripts), `Integrity-Policy-Report-Only` and `Reporting-Endpoints`. It never blocks anything: the browser only says what it would have refused.
+
+```js
+const { nonce, headers } = guard.headers()          // in your middleware or layout
+for (const [k, v] of Object.entries(headers)) response.headers.set(k, v)
+// put the nonce on your own scripts: <script nonce={nonce} ...>
+```
+
+The browsers send their reports to a path of your own site (`/_bitora/r` by default, `createGuard({ csp: { reportPath } })`). The Next.js, Hono, Deno and Express adapters answer it for you (make sure your middleware matcher includes the path); with another framework call `await guard.reports(request)` first and return its Response when it is not `null`. The package keeps only the **directive** and the **host** (or the words inline, eval, sink): never the script sample, the file name, the full URL or the page's query string. Browser extensions are ignored. Anybody can post to that path, so one instance accepts 200 reports an hour (`csp.maxPerHour`) and Bitora shows them as a possibility, not as proof. Without a licence `guard.headers()` returns no headers.
+
 ## When Bitora does not answer, and the off switch
 
 Everything the package asks of Bitora (the list of blocked addresses, per-address checks, `guard.decide`, the event batches) goes through
 one circuit breaker. After five failures in a row it stops asking for 5 seconds, then lets one call through to see whether Bitora is back;
 each failed probe doubles the pause (up to 5 minutes) and one answer closes the breaker. Meanwhile the traffic goes through and what was
-seen waits to be sent. Your site never waits on ours.
+seen waits to be sent. Your site never waits on ours. A shared store for `guard.limit()` (Redis, Upstash) has its own breaker and a half-second cut, so a store that hangs does not hold up requests either.
 
 To turn the package off completely (nothing inspected, limited or sent; the site behaves as if it were not installed) set
 `BITORA_GUARD_DISABLED=1`, or pass `createGuard({ disabled: () => myFlag() })` to read your own flag on every call. `guard.license.status()`
