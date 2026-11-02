@@ -26,7 +26,7 @@ jobs:
         with:
           node-version: '24'
           registry-url: 'https://registry.npmjs.org'
-      - run: node --test guard.test.mjs
+      - run: node --test guard.test.mjs bench/bench.test.mjs
       - name: The tag must be the version in pkg/package.json
         if: startsWith(github.ref, 'refs/tags/')
         working-directory: pkg

@@ -15,19 +15,55 @@ const MAX_LEN = 4000
 const SQL_WORDS = 'select|insert|update|delete|drop|create|alter|truncate|exec|execute|union|merge|declare|waitfor|raiserror|shutdown'
 
 // ---- decoding ----
-function decode(v) {
-  let s = String(v)
-  for (let i = 0; i < 2; i++) {
-    try {
-      const d = decodeURIComponent(s.replace(/\+/g, ' '))
-      if (d === s) break
-      s = d
-    } catch {
-      break
-    }
+// What an attacker sends is rarely what a rule is written for, so every value goes through the same bounded pipeline before the rules see it:
+// percent-decoding (tolerant of a stray %), HTML entities, Unicode compatibility folding (NFKC: full-width characters become ASCII) and removal
+// of NUL bytes, repeated until nothing changes or three layers have been peeled. The input is capped (MAX_LEN) and each layer is linear, so a
+// "decoding bomb" costs a fixed, small amount of time. A NUL byte is itself a signal (see lfi.null-byte), so the pipeline says whether it saw one.
+const ENTITY = { lt: '<', gt: '>', quot: '"', apos: "'", amp: '&' }
+
+function percentDecode(s) {
+  try {
+    return decodeURIComponent(s)
+  } catch {
+    // a stray % makes the whole string invalid: decode the valid runs and leave the rest as it is
+    return s.replace(/(?:%[0-9a-f]{2})+/gi, (m) => {
+      try {
+        return decodeURIComponent(m)
+      } catch {
+        return m
+      }
+    })
   }
-  return s
 }
+
+export function normalize(v) {
+  let s = String(v).slice(0, MAX_LEN * 2)
+  let nul = false
+  for (let i = 0; i < 3; i++) {
+    let next = percentDecode(s.replace(/\+/g, ' '))
+    next = next.replace(/&(#x[0-9a-f]{1,6}|#\d{1,7}|lt|gt|quot|apos|amp);?/gi, (m, e) => {
+      if (e[0] === '#') {
+        const n = e[1] === 'x' || e[1] === 'X' ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10)
+        return n > 0 && n < 0x110000 ? String.fromCodePoint(n) : m
+      }
+      return ENTITY[e.toLowerCase()] ?? m
+    })
+    if (next.includes('\0')) {
+      nul = true
+      next = next.replace(/\0/g, '')
+    }
+    try {
+      next = next.normalize('NFKC')
+    } catch {
+      /* a lone surrogate: keep it as it is */
+    }
+    if (next === s) break
+    s = next
+  }
+  return { text: s, nul }
+}
+
+const decode = (v) => normalize(v).text
 
 // What a SQL parser would see: comments gone, whitespace collapsed, lower case.
 const sqlView = (s) =>
@@ -59,7 +95,7 @@ export const RULES = [
   { id: 'sqli.case-when', pl: 1, pts: 5, w: 'value', test: (v) => /\bcase when\b[^&]{0,80}[=<>][^&]{0,40}\bthen\b/.test(sqlView(v)) },
   { id: 'sqli.numeric-compare', pl: 1, pts: 5, w: 'value', test: (v) => /\b(?:and|or) \(*\d{2,}\)* ?= ?\(*\d{2,}/.test(sqlView(v)) },
   { id: 'sqli.order-by-comment', pl: 1, pts: 5, w: 'value', test: (v) => /\border by \d+ ?(?:--|#|\/\*)/.test(sqlView(v)) },
-  { id: 'sqli.subquery', pl: 1, pts: 5, w: 'value', test: (v) => /\(\s?select (?:\(|@@|\*|\d|null\b|count\b|case\b|chr\b|char\b|concat\b|cast\b|top\b|distinct\b|user\b|version\b|database\b|sleep\b|extractvalue\b|updatexml\b)/.test(sqlView(v)) },
+  { id: 'sqli.subquery', pl: 1, pts: 5, w: 'value', test: (v) => /\(\s?select (?:\(|@@|\*|\d|null\b|count\b|case\b|chr\b|char\b|concat\b|cast\b|top\b|distinct\b|(?:current_|session_|system_)?user\b|version\b|(?:current_)?(?:database|schema)\b|sleep\b|extractvalue\b|updatexml\b)/.test(sqlView(v)) },
   { id: 'sqli.function', pl: 1, pts: 5, w: 'value', test: (v) => /\b(?:sleep|benchmark|pg_sleep|load_file|extractvalue|updatexml|dbms_pipe\.receive_message)\s?\(|\bwaitfor delay\b/.test(sqlView(v)) },
   { id: 'sqli.schema', pl: 1, pts: 4, w: 'value', test: (v) => /\b(?:information_schema|pg_catalog|sqlite_master|sysobjects|mysql\.user)\b/.test(sqlView(v)) },
   { id: 'sqli.comment-after-quote', pl: 2, pts: 3, w: 'value', test: (v) => /['"] ?(?:--(?: |$)|#$|\/\*)/.test(sqlView(v)) && /['"]/.test(v) && /(?:\b(?:or|and|union|select)\b)/.test(sqlView(v)) },
@@ -76,6 +112,8 @@ export const RULES = [
   { id: 'lfi.sensitive-file', pl: 1, pts: 5, w: 'value', test: (v) => /\/etc\/(?:passwd|shadow|hosts)\b|\/proc\/self\/|\bboot\.ini\b|\bwindows\\(?:system32|win\.ini)/i.test(v) },
   { id: 'lfi.wrapper', pl: 1, pts: 5, w: 'value', test: (v) => /^\s*(?:php|phar|expect|gopher|dict|ldap|jar|file):\/\//i.test(v) || /php:\/\/(?:filter|input)/i.test(v) },
   { id: 'lfi.null-byte', pl: 1, pts: 4, w: 'value', test: (v) => v.includes('\0') },
+  // One step up to a file nobody asks for in a parameter: .env, .git, keys and credentials
+  { id: 'lfi.dotfile', pl: 1, pts: 5, w: 'value', test: (v) => /(?:\.\.[/\\])+\.?(?:env\b|git[/\\]|htpasswd|ssh[/\\]|aws[/\\]|npmrc|netrc)/i.test(v) },
 
   // Command injection
   { id: 'rce.shell', pl: 1, pts: 5, w: 'value', test: (v) => /(?:[;|&`]|\$\(|\|\||&&) ?(?:cat|ls|id|whoami|uname|wget|curl|nc|ncat|bash|sh|zsh|powershell|cmd(?:\.exe)?|python3?|perl|ruby|php|rm|chmod|chown)\b(?: +-\w| +\/\w| +\.\.?\/| +https?:| *(?:$|[;|&)`]))/.test(v) },
@@ -84,7 +122,7 @@ export const RULES = [
 
   // NoSQL operators and prototype pollution arrive as parameter NAMES
   { id: 'nosql.operator', pl: 1, pts: 5, w: 'key', test: (k) => OPERATORS.has(k.toLowerCase()) || /\[(\$[a-z]+)\]/i.test(k) && OPERATORS.has(/\[(\$[a-z]+)\]/i.exec(k)[1].toLowerCase()) },
-  { id: 'proto.pollution', pl: 1, pts: 5, w: 'key', test: (k, n) => k === '__proto__' || /(?:^|\.)constructor\.prototype(?:\.|$)/.test(n || k) || /__proto__/.test(k) },
+  { id: 'proto.pollution', pl: 1, pts: 5, w: 'key', test: (k, n) => k === '__proto__' || /(?:^|[.\[])constructor(?:\.|\]?\[)prototype(?:\]|\.|\[|$)/.test(n || k) || /__proto__/.test(k) },
 
   // A parameter that carries a URL aimed at the inside of the network (SSRF)
   { id: 'ssrf.metadata', pl: 1, pts: 5, w: 'value', test: (v) => METADATA_HOST.test(urlHost(v)) },
@@ -121,7 +159,7 @@ function queryParams(search) {
     const i = part.indexOf('=')
     const rawKey = i < 0 ? part : part.slice(0, i)
     const rawVal = i < 0 ? '' : part.slice(i + 1)
-    out.push([decode(rawKey), decode(rawVal).slice(0, MAX_LEN)])
+    out.push([decode(rawKey), rawVal.slice(0, MAX_LEN * 2)])
   }
   return out
 }
@@ -159,7 +197,12 @@ export function createShield(cfg = {}) {
     }
     for (const { name, value } of out.values) {
       if (!value) continue
-      const v = decode(value)
+      const norm = normalize(value)
+      const v = norm.text
+      if (norm.nul) {
+        const r = rules.find((x) => x.id === 'lfi.null-byte')
+        if (r) add(r, name)
+      }
       for (const r of rules) if ((r.w === 'value' || r.w === 'any') && safely(r, v)) add(r, name)
     }
     for (const { name, key } of out.keys) for (const r of rules) if (r.w === 'key' && safely(r, key, name)) add(r, name)
