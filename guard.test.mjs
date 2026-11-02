@@ -1593,3 +1593,26 @@ test('reports: anybody can post to that path, so one instance accepts a limited 
   await g.flush()
   assert.equal(b.calls.events.flat().length, 6, 'a new hour, a new allowance')
 })
+
+test('navigations: the guard sends only how many page navigations of a browser it saw, so Bitora can say how much of them reaches the snippet', async () => {
+  const b = fakeBitora()
+  const g = createGuard({ secret: 'k', fetch: b.fetch, trustProxy: 1, remote: { enabled: false } })
+  const nav = (path, extra = {}) => new Request('https://shop.example.com' + path, { headers: { 'x-forwarded-for': '203.0.113.7', 'user-agent': 'Mozilla/5.0 Chrome/120', 'sec-fetch-dest': 'document', 'sec-fetch-mode': 'navigate', ...extra } })
+  for (let i = 0; i < 5; i++) await g.check(nav('/p' + i))
+  await g.check(nav('/p', { 'sec-purpose': 'prefetch' })) // a browser guessing, not a person
+  await g.check(new Request('https://shop.example.com/api/x', { headers: { 'x-forwarded-for': '203.0.113.7', 'sec-fetch-dest': 'empty', 'sec-fetch-mode': 'cors' } }))
+  await g.check(new Request('https://shop.example.com/', { headers: { 'x-forwarded-for': '203.0.113.7', 'user-agent': 'curl/8' } })) // a tool sends no Fetch Metadata
+  await g.check(new Request('https://shop.example.com/', { method: 'POST', headers: { 'x-forwarded-for': '203.0.113.7', 'sec-fetch-dest': 'document', 'sec-fetch-mode': 'navigate' } }))
+  await g.flush()
+  const sent = b.calls.events.flat().filter((e) => e.kind === 'navigations')
+  assert.equal(sent.length, 1)
+  assert.equal(sent[0].count, 5)
+  assert.ok(!('path' in sent[0]) || sent[0].path === '/', 'no page is named, only a number')
+  await g.flush()
+  assert.equal(b.calls.events.flat().filter((e) => e.kind === 'navigations').length, 1, 'counted once')
+  // with reporting off nothing is counted or sent
+  const quiet = createGuard({ secret: 'k', fetch: b.fetch, trustProxy: 1, remote: { enabled: false }, report: { enabled: false } })
+  await quiet.check(nav('/x'))
+  await quiet.flush()
+  assert.equal(b.calls.events.flat().filter((e) => e.kind === 'navigations').length, 1)
+})

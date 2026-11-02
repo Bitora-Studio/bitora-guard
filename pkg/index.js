@@ -183,6 +183,7 @@ export function describe(req, opts = {}) {
     method: (req.method || 'GET').toUpperCase(),
     agent: h('user-agent'),
     fetchSite: String(h('sec-fetch-site')).toLowerCase(),
+    navigation: String(h('sec-fetch-dest')).toLowerCase() === 'document' && String(h('sec-fetch-mode')).toLowerCase() === 'navigate' && !/prefetch|prerender/i.test(String(h('sec-purpose'))),
     contentLength: Number(h('content-length')) || 0,
     urlLength: String(req.originalUrl || req.url || '').length,
     search: searchOf(req),
@@ -310,10 +311,15 @@ export function createGuard(options = {}) {
   }
 
   // Sends what has been seen as one batch. Never awaited by a request and never throws: reporting must not slow a page.
+  let navCount = 0
   function flush() {
-    if (!events.size || !o.secret || !doFetch || !breaker.allow()) return Promise.resolve() // while Bitora does not answer, what was seen waits
+    if ((!events.size && !navCount) || !o.secret || !doFetch || !breaker.allow()) return Promise.resolve() // while Bitora does not answer, what was seen waits
     const batch = [...events.values()].slice(0, 100)
     events = new Map()
+    if (navCount) {
+      batch.push({ kind: 'navigations', count: navCount, ip: '', path: '/', window_s: 0, score: 0, action: 'reported', ip_source: 'none' })
+      navCount = 0
+    }
     lastFlush = now()
     return Promise.resolve(
       doFetch(o.apiUrl + '/api/v1/guard/events', {
@@ -416,6 +422,12 @@ export function createGuard(options = {}) {
     try {
       const r = describe(req, o)
       if (r.method === 'OPTIONS' || o.skip.some((p) => r.path.startsWith(p))) return allow
+      // A page navigation of a browser (Fetch Metadata: a person opening a page, not a script or a tool). Only the NUMBER of them is kept and sent: Bitora
+      // compares it with the page views the snippet reports to say how much of what you serve reaches the snippet.
+      if (r.navigation && r.method === 'GET' && o.report.enabled && o.secret) {
+        navCount++
+        if (now() - lastFlush >= o.report.flushMs) flush()
+      }
       const t = now()
       const hasIp = Boolean(r.ip)
       const ipKey = r.ip

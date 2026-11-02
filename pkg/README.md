@@ -177,6 +177,10 @@ seen. What it has learned can be written down for your code: `guard.schema.zod()
 Try a rule on real traffic before it is allowed to refuse anybody: `createGuard({ shield: { shadow: ['sqli.union', 'xss'] } })`. A rule (or a
 whole family, without the dot) in shadow mode is evaluated and reported as "would have" but adds no points and never blocks.
 
+## How much of your pages reaches the snippet
+
+The package counts the page navigations of browsers it sees (requests with Fetch Metadata `sec-fetch-dest: document` and `sec-fetch-mode: navigate`, not prefetches) and sends **only that number** with its event batches, no path, address or user. Bitora compares it with the page views the snippet reports and shows the share in the coverage of the site. It only counts the requests that go through the package: with a Next.js matcher limited to `/api/*` it sees no pages and the line says there is not enough data. Ad blockers and disabled JavaScript lower the share legitimately, so read it against your own normal, not against 100 %.
+
 ## A strict CSP, tried first (report-only)
 
 `guard.headers()` returns a nonce and the headers of a strict policy sent as **report-only**: `Content-Security-Policy-Report-Only` (`script-src` with your nonce and `strict-dynamic`, `object-src 'none'`, `base-uri 'none'`, Trusted Types for scripts), `Integrity-Policy-Report-Only` and `Reporting-Endpoints`. It never blocks anything: the browser only says what it would have refused.
